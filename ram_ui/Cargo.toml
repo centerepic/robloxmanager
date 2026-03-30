@@ -1,0 +1,23 @@
+[package]
+name = "ram_ui"
+version = "1.0.0"
+edition = "2021"
+description = "GUI for RM — Roblox Account Manager"
+license = "MIT"
+repository = "https://github.com/YOUR_USERNAME/ram2"
+authors = ["RM Contributors"]
+
+[dependencies]
+ram_core = { path = "../ram_core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = "0.4"
+
+eframe = "0.30"
+egui_extras = { version = "0.30", features = ["image", "http"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"

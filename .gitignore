@@ -1,0 +1,6 @@
+/target
+*.dat
+config.json
+*.exe
+*.pdb
+*.log

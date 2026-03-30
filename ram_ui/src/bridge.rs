@@ -98,6 +98,8 @@ pub enum BackendCommand {
     },
     /// Arrange all Roblox windows in a tiled grid.
     ArrangeWindows,
+    /// Check GitHub for a newer release.
+    CheckForUpdates { current_version: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +144,8 @@ pub enum BackendEvent {
     Error(String),
     /// Windows were arranged.
     WindowsArranged,
+    /// A newer version is available on GitHub.
+    UpdateAvailable { version: String, url: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -535,6 +539,18 @@ async fn handle_command(
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             process::arrange_roblox_windows();
             Ok(BackendEvent::WindowsArranged)
+        }
+        BackendCommand::CheckForUpdates { current_version } => {
+            match api::check_for_updates(&current_version).await {
+                Ok(Some((version, url))) => {
+                    Ok(BackendEvent::UpdateAvailable { version, url })
+                }
+                Ok(None) => Ok(BackendEvent::StoreSaved), // no-op event
+                Err(e) => {
+                    info!("Update check failed (non-fatal): {e}");
+                    Ok(BackendEvent::StoreSaved) // silently ignore
+                }
+            }
         }
     }
 }

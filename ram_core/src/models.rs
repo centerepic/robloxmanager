@@ -144,6 +144,9 @@ pub struct AppConfig {
     /// Replace usernames/display names with generic "Account 1", "Account 2", etc.
     #[serde(default)]
     pub anonymize_names: bool,
+    /// Last version the user has seen — used to detect first launch after update.
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -152,8 +155,11 @@ fn default_true() -> bool {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let data_dir = std::env::var("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
         Self {
-            accounts_path: PathBuf::from("accounts.dat"),
+            accounts_path: data_dir.join("RM").join("accounts.dat"),
             use_credential_manager: false,
             multi_instance_enabled: false,
             kill_background_roblox: false,
@@ -165,6 +171,7 @@ impl Default for AppConfig {
             privacy_mode: true,
             auto_arrange_windows: false,
             anonymize_names: false,
+            last_seen_version: None,
         }
     }
 }

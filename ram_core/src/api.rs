@@ -183,3 +183,37 @@ pub async fn fetch_servers(
     let resp: ServerListResponse = client.get_json(&url, cookie).await?;
     Ok((resp.data, resp.next_page_cursor))
 }
+
+// ---------------------------------------------------------------------------
+// GitHub update check
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+/// Check for a newer release on GitHub. Returns `Some((version, url))` if an
+/// update is available, `None` if already on the latest.
+pub async fn check_for_updates(current_version: &str) -> Result<Option<(String, String)>, CoreError> {
+    let client = reqwest::Client::builder()
+        .user_agent("RM-update-check")
+        .build()?;
+
+    let release: GitHubRelease = client
+        .get("https://api.github.com/repos/centerepic/robloxmanager/releases/latest")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let remote = release.tag_name.trim_start_matches('v');
+    let local = current_version.trim_start_matches('v');
+
+    if remote != local {
+        Ok(Some((remote.to_string(), release.html_url)))
+    } else {
+        Ok(None)
+    }
+}

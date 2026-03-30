@@ -75,6 +75,11 @@ pub struct AppState {
 
     /// When set, shows a confirmation dialog before removing the account.
     confirm_remove: Option<u64>,
+
+    /// Available update info: (version, release_url).
+    update_available: Option<(String, String)>,
+    /// Show the "What's New" changelog window.
+    show_changelog: bool,
 }
 
 impl AppState {
@@ -100,7 +105,7 @@ impl AppState {
             }
         }
 
-        Self {
+        let mut state = Self {
             config,
             config_path,
             store: AccountStore::default(),
@@ -121,7 +126,27 @@ impl AppState {
             needs_unlock,
             unlock_password_input: String::new(),
             confirm_remove: None,
+            update_available: None,
+            show_changelog: false,
+        };
+
+        // Check for updates on startup
+        state.bridge.send(BackendCommand::CheckForUpdates {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+
+        // Detect first launch after update
+        let current = env!("CARGO_PKG_VERSION");
+        let is_new_version = state.config.last_seen_version.as_deref() != Some(current);
+        if is_new_version && state.config.last_seen_version.is_some() {
+            // Upgraded from a previous version — show changelog
+            state.show_changelog = true;
         }
+        // Always update the stored version
+        state.config.last_seen_version = Some(current.to_string());
+        let _ = state.config.save(&state.config_path);
+
+        state
     }
 
     // ---- Event processing ----
@@ -250,6 +275,9 @@ impl AppState {
                         self.add_dialog.last_error = Some(msg.clone());
                     }
                     self.toasts.push(Toast::error(msg));
+                }
+                BackendEvent::UpdateAvailable { version, url } => {
+                    self.update_available = Some((version, url));
                 }
             }
         }
@@ -401,6 +429,13 @@ impl eframe::App for AppState {
                 ui.selectable_value(&mut self.active_tab, Tab::Accounts, "📋 Accounts");
                 ui.selectable_value(&mut self.active_tab, Tab::Settings, "⚙ Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some((ref version, ref url)) = self.update_available {
+                        let text = format!("⬆ Update v{version} available");
+                        if ui.link(text).on_hover_text("Click to open the download page").clicked() {
+                            ui.output_mut(|o| o.open_url = Some(egui::output::OpenUrl::new_tab(url)));
+                        }
+                        ui.separator();
+                    }
                     if self.roblox_running {
                         ui.colored_label(
                             egui::Color32::from_rgb(30, 144, 255),
@@ -443,6 +478,9 @@ impl eframe::App for AppState {
 
         // ---- Confirmation dialog for account removal ----
         self.show_confirm_remove_dialog(ctx);
+
+        // ---- Changelog window ----
+        self.show_changelog_window(ctx);
 
         // ---- Toasts ----
         self.toasts.show(ctx);
@@ -870,6 +908,45 @@ impl AppState {
             });
         if !keep_open {
             self.confirm_remove = None;
+        }
+    }
+
+    fn show_changelog_window(&mut self, ctx: &egui::Context) {
+        if !self.show_changelog {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(format!("What's New in v{}", env!("CARGO_PKG_VERSION")))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(480.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        let changelog = include_str!("../../CHANGELOG.md");
+                        // Show only the section for the current version
+                        let current = format!("## v{}", env!("CARGO_PKG_VERSION"));
+                        if let Some(start) = changelog.find(&current) {
+                            let section = &changelog[start..];
+                            // Find the next version header to truncate
+                            let end = section[current.len()..]
+                                .find("\n## v")
+                                .map(|i| i + current.len())
+                                .unwrap_or(section.len());
+                            ui.label(&section[..end]);
+                        } else {
+                            ui.label(changelog);
+                        }
+                    });
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    self.show_changelog = false;
+                }
+            });
+        if !open {
+            self.show_changelog = false;
         }
     }
 }

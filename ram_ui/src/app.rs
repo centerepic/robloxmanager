@@ -928,16 +928,31 @@ impl AppState {
                         let changelog = include_str!("../../CHANGELOG.md");
                         // Show only the section for the current version
                         let current = format!("## v{}", env!("CARGO_PKG_VERSION"));
-                        if let Some(start) = changelog.find(&current) {
-                            let section = &changelog[start..];
-                            // Find the next version header to truncate
-                            let end = section[current.len()..]
+                        let section = if let Some(start) = changelog.find(&current) {
+                            let rest = &changelog[start..];
+                            let end = rest[current.len()..]
                                 .find("\n## v")
                                 .map(|i| i + current.len())
-                                .unwrap_or(section.len());
-                            ui.label(&section[..end]);
+                                .unwrap_or(rest.len());
+                            &rest[..end]
                         } else {
-                            ui.label(changelog);
+                            changelog
+                        };
+                        // Render markdown-lite
+                        for line in section.lines() {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                ui.add_space(2.0);
+                            } else if let Some(h) = trimmed.strip_prefix("### ") {
+                                ui.add_space(4.0);
+                                ui.strong(h);
+                            } else if let Some(h) = trimmed.strip_prefix("## ") {
+                                ui.heading(h);
+                            } else if let Some(item) = trimmed.strip_prefix("- ") {
+                                Self::render_md_line(ui, &format!("  • {item}"));
+                            } else {
+                                Self::render_md_line(ui, trimmed);
+                            }
                         }
                     });
                 ui.add_space(8.0);
@@ -948,5 +963,59 @@ impl AppState {
         if !open {
             self.show_changelog = false;
         }
+    }
+
+    /// Render a single line with **bold** spans converted to egui RichText.
+    fn render_md_line(ui: &mut egui::Ui, line: &str) {
+        let mut job = egui::text::LayoutJob::default();
+        let style = ui.style();
+        let normal_color = style.visuals.text_color();
+        let normal_font = egui::FontId::proportional(14.0);
+        let bold_font = egui::FontId {
+            size: 14.0,
+            family: egui::FontFamily::Proportional,
+        };
+
+        let mut remaining = line;
+        while let Some(start) = remaining.find("**") {
+            // Text before the bold marker
+            let before = &remaining[..start];
+            if !before.is_empty() {
+                job.append(before, 0.0, egui::text::TextFormat {
+                    font_id: normal_font.clone(),
+                    color: normal_color,
+                    ..Default::default()
+                });
+            }
+            remaining = &remaining[start + 2..];
+            // Find the closing **
+            if let Some(end) = remaining.find("**") {
+                let bold_text = &remaining[..end];
+                job.append(bold_text, 0.0, egui::text::TextFormat {
+                    font_id: bold_font.clone(),
+                    color: normal_color,
+                    italics: false,
+                    ..Default::default()
+                });
+                remaining = &remaining[end + 2..];
+            } else {
+                // No closing ** — just emit the rest as normal
+                job.append(&format!("**{remaining}"), 0.0, egui::text::TextFormat {
+                    font_id: normal_font.clone(),
+                    color: normal_color,
+                    ..Default::default()
+                });
+                remaining = "";
+            }
+        }
+        // Remaining plain text
+        if !remaining.is_empty() {
+            job.append(remaining, 0.0, egui::text::TextFormat {
+                font_id: normal_font,
+                color: normal_color,
+                ..Default::default()
+            });
+        }
+        ui.label(job);
     }
 }

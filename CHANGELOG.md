@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.2.1
+
+### Fixed
+- **"What's New" window** — changelog now renders with proper formatting (headings, bold text, bullet points) instead of raw markdown.
+
 ## v1.2.0
 
 ### Added

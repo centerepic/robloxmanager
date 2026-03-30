@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Core library for RM — Roblox Account Manager"
 license = "MIT"
-repository = "https://github.com/YOUR_USERNAME/ram2"
+repository = "https://github.com/centerepic/robloxmanager"
 authors = ["RM Contributors"]
 
 [dependencies]

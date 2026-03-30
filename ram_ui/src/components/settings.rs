@@ -14,18 +14,10 @@ pub enum SettingsAction {
 }
 
 /// Persistent state for the settings panel password change UI.
+#[derive(Default)]
 pub struct SettingsState {
     pub new_password_input: String,
     pub confirm_password_input: String,
-}
-
-impl Default for SettingsState {
-    fn default() -> Self {
-        Self {
-            new_password_input: String::new(),
-            confirm_password_input: String::new(),
-        }
-    }
 }
 
 /// Draw the settings UI. Returns `Some(SettingsAction)` when an action is triggered.

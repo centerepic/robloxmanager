@@ -27,7 +27,7 @@ use crate::models::AccountStore;
 fn derive_key(password: &str) -> [u8; 32] {
     let mut hash = Sha256::digest(password.as_bytes());
     for _ in 0..100_000 {
-        hash = Sha256::digest(&hash);
+        hash = Sha256::digest(hash);
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash);

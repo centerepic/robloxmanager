@@ -108,7 +108,7 @@ pub enum BackendCommand {
 pub enum BackendEvent {
     /// An account was validated and is ready to be added.
     AccountValidated {
-        account: Account,
+        account: Box<Account>,
         encrypted_cookie: Option<String>,
     },
     /// Account removed.
@@ -250,7 +250,7 @@ async fn handle_command(
 
             info!("Validated account {} ({})", account.username, user_id);
             Ok(BackendEvent::AccountValidated {
-                account,
+                account: Box::new(account),
                 encrypted_cookie: encrypted,
             })
         }

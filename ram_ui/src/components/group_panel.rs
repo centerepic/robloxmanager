@@ -18,18 +18,10 @@ pub enum GroupPanelAction {
 }
 
 /// Persistent input state for the group panel.
+#[derive(Default)]
 pub struct GroupPanelState {
     pub place_id_input: String,
     pub job_id_input: String,
-}
-
-impl Default for GroupPanelState {
-    fn default() -> Self {
-        Self {
-            place_id_input: String::new(),
-            job_id_input: String::new(),
-        }
-    }
 }
 
 /// Draw the group control panel for multiple selected accounts.
@@ -115,10 +107,10 @@ pub fn show(
                 }
             }
 
-            if roblox_running {
-                if ui.button("\u{2620}  Kill All Instances").clicked() {
-                    action = Some(GroupPanelAction::KillAll);
-                }
+            if roblox_running
+                && ui.button("\u{2620}  Kill All Instances").clicked()
+            {
+                action = Some(GroupPanelAction::KillAll);
             }
         });
     });

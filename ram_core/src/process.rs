@@ -279,7 +279,7 @@ fn native_get_cmdline(pid: u32) -> Option<String> {
 
     // Locate NtQueryInformationProcess in ntdll.dll
     let ntdll = unsafe {
-        windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"ntdll.dll\0".as_ptr())
+        windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(c"ntdll.dll".as_ptr().cast())
     };
     if ntdll.is_null() {
         return None;
@@ -287,7 +287,7 @@ fn native_get_cmdline(pid: u32) -> Option<String> {
     let fn_ptr = unsafe {
         windows_sys::Win32::System::LibraryLoader::GetProcAddress(
             ntdll,
-            b"NtQueryInformationProcess\0".as_ptr(),
+            c"NtQueryInformationProcess".as_ptr().cast(),
         )
     };
     let nt_query: NtQueryInformationProcessFn = unsafe { std::mem::transmute(fn_ptr?) };
@@ -414,7 +414,6 @@ fn native_get_cmdline(pid: u32) -> Option<String> {
 ///
 /// **This technique interacts with Hyperion (Byfron) and carries ban risk.**
 /// It is gated behind `AppConfig::multi_instance_enabled` (default: off).
-
 #[cfg(windows)]
 mod multi_instance {
     use std::sync::OnceLock;
@@ -447,7 +446,7 @@ mod multi_instance {
             }
             MutexHandle(handle)
         });
-        HELD_MUTEX.get().map_or(false, |h| !h.0.is_null())
+        HELD_MUTEX.get().is_some_and(|h| !h.0.is_null())
     }
 }
 

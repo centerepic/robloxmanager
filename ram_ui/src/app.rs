@@ -24,6 +24,7 @@ enum Tab {
 // Add-account dialog state
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct AddAccountDialog {
     open: bool,
     cookie_input: String,
@@ -33,18 +34,6 @@ struct AddAccountDialog {
     loading: bool,
     /// Error message from the last failed attempt.
     last_error: Option<String>,
-}
-
-impl Default for AddAccountDialog {
-    fn default() -> Self {
-        Self {
-            open: false,
-            cookie_input: String::new(),
-            password_input: String::new(),
-            loading: false,
-            last_error: None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +136,7 @@ impl AppState {
                     let name = account.username.clone();
                     // Avoid duplicates
                     self.store.remove_by_id(account.user_id);
-                    self.store.accounts.push(account);
+                    self.store.accounts.push(*account);
                     self.toasts.push(Toast::success(format!("Added {name}")));
                     self.add_dialog.loading = false;
                     self.add_dialog.last_error = None;
@@ -337,20 +326,20 @@ impl eframe::App for AppState {
         self.process_events();
 
         // Periodically refresh roblox_running flag (every ~120 frames ≈ 2s)
-        if self.frame_count % 120 == 0 {
+        if self.frame_count.is_multiple_of(120) {
             self.roblox_running = ram_core::process::is_roblox_running();
         }
 
         // Periodically kill background tray Roblox processes when enabled
         // (every ~600 frames ≈ 10s)
         if (self.config.kill_background_roblox || self.config.multi_instance_enabled)
-            && self.frame_count % 600 == 0
+            && self.frame_count.is_multiple_of(600)
         {
             ram_core::process::kill_tray_roblox();
         }
 
         // Periodically refresh presence for visible accounts (every ~600 frames ≈ 10s)
-        if self.frame_count % 600 == 0 && !self.visible_user_ids.is_empty() {
+        if self.frame_count.is_multiple_of(600) && !self.visible_user_ids.is_empty() {
             self.trigger_presence_refresh();
         }
 
@@ -655,11 +644,11 @@ impl AppState {
                 self.selected_ids.clear();
             }
             // Delete: prompt to remove selected account(s)
-            if i.key_pressed(egui::Key::Delete) && !any_text_focused {
-                if self.selected_ids.len() == 1 {
-                    let uid = *self.selected_ids.iter().next().unwrap();
-                    self.confirm_remove = Some(uid);
-                }
+            if i.key_pressed(egui::Key::Delete) && !any_text_focused
+                && self.selected_ids.len() == 1
+            {
+                let uid = *self.selected_ids.iter().next().unwrap();
+                self.confirm_remove = Some(uid);
             }
         });
     }

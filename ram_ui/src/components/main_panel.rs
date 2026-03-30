@@ -14,6 +14,7 @@ pub enum MainPanelAction {
 }
 
 /// Persistent input state for the main panel.
+#[derive(Default)]
 pub struct MainPanelState {
     pub place_id_input: String,
     pub job_id_input: String,
@@ -21,18 +22,6 @@ pub struct MainPanelState {
     /// Track which account the alias input belongs to.
     alias_for_user: Option<u64>,
     pub favorite_name_input: String,
-}
-
-impl Default for MainPanelState {
-    fn default() -> Self {
-        Self {
-            place_id_input: String::new(),
-            job_id_input: String::new(),
-            alias_input: String::new(),
-            alias_for_user: None,
-            favorite_name_input: String::new(),
-        }
-    }
 }
 
 /// Draw the main panel for a selected account. Returns an optional action.
@@ -180,10 +169,10 @@ pub fn show(
                 }
             }
 
-            if roblox_running {
-                if ui.button("☠  Kill All Instances").clicked() {
-                    action = Some(MainPanelAction::KillAll);
-                }
+            if roblox_running
+                && ui.button("☠  Kill All Instances").clicked()
+            {
+                action = Some(MainPanelAction::KillAll);
             }
         });
         }); // launch frame

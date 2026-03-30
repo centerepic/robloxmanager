@@ -141,6 +141,9 @@ pub struct AppConfig {
     /// Automatically arrange Roblox windows in a grid after launching.
     #[serde(default)]
     pub auto_arrange_windows: bool,
+    /// Replace usernames/display names with generic "Account 1", "Account 2", etc.
+    #[serde(default)]
+    pub anonymize_names: bool,
 }
 
 fn default_true() -> bool {
@@ -161,6 +164,7 @@ impl Default for AppConfig {
             favorite_places: Vec::new(),
             privacy_mode: true,
             auto_arrange_windows: false,
+            anonymize_names: false,
         }
     }
 }

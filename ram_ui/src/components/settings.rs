@@ -113,6 +113,10 @@ pub fn show(
             &mut config.privacy_mode,
             "Clear RobloxCookies.dat before each launch",
         ).on_hover_text("Prevents Roblox from associating your accounts via stored cookies.");
+        ui.checkbox(
+            &mut config.anonymize_names,
+            "Anonymize account names",
+        ).on_hover_text("Replaces usernames and display names with generic \"Account 1\", \"Account 2\", etc.");
     });
     ui.add_space(6.0);
 

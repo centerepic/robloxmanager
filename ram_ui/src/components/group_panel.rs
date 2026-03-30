@@ -30,6 +30,7 @@ pub fn show(
     selected_accounts: &[&Account],
     state: &mut GroupPanelState,
     roblox_running: bool,
+    anonymize: bool,
 ) -> Option<GroupPanelAction> {
     let mut action: Option<GroupPanelAction> = None;
     let count = selected_accounts.len();
@@ -50,7 +51,7 @@ pub fn show(
         egui::ScrollArea::vertical()
             .max_height(150.0)
             .show(ui, |ui| {
-                for account in selected_accounts {
+                for (idx, account) in selected_accounts.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let dot = presence_color(account.last_presence.user_presence_type);
                         let (dot_rect, _) =
@@ -60,7 +61,11 @@ pub fn show(
                             4.0,
                             dot,
                         );
-                        ui.label(account.label());
+                        ui.label(if anonymize {
+                            format!("Account {}", idx + 1)
+                        } else {
+                            account.label().to_string()
+                        });
                     });
                 }
             });

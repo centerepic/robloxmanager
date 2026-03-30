@@ -32,6 +32,7 @@ pub fn show(
     roblox_running: bool,
     avatar_bytes: Option<&Vec<u8>>,
     favorite_places: &[FavoritePlace],
+    anonymize: bool,
 ) -> Option<MainPanelAction> {
     let mut action: Option<MainPanelAction> = None;
 
@@ -75,9 +76,13 @@ pub fn show(
             }
 
             ui.vertical(|ui| {
-                ui.heading(&account.display_name);
-                ui.label(format!("@{}", account.username));
-                ui.label(format!("ID: {}", account.user_id));
+                if anonymize {
+                    ui.heading("Account");
+                } else {
+                    ui.heading(&account.display_name);
+                    ui.label(format!("@{}", account.username));
+                    ui.label(format!("ID: {}", account.user_id));
+                }
 
                 // Presence badge
                 let status = account.last_presence.status_text();
@@ -101,20 +106,19 @@ pub fn show(
 
         // Favorite places quick-select
         if !favorite_places.is_empty() {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Favorites:");
                 for (i, fav) in favorite_places.iter().enumerate() {
-                    if ui.small_button(&fav.name).clicked() {
+                    let btn = ui.small_button(&fav.name);
+                    if btn.clicked() {
                         state.place_id_input = fav.place_id.to_string();
                     }
-                    // Right-click to remove
-                    if ui.interact(
-                        ui.min_rect(),
-                        egui::Id::new(("fav_ctx", i)),
-                        egui::Sense::click(),
-                    ).secondary_clicked() {
-                        action = Some(MainPanelAction::RemoveFavorite(i));
-                    }
+                    btn.context_menu(|ui| {
+                        if ui.button("🗑 Remove").clicked() {
+                            action = Some(MainPanelAction::RemoveFavorite(i));
+                            ui.close_menu();
+                        }
+                    });
                 }
             });
             ui.add_space(4.0);

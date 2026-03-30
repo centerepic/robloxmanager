@@ -133,7 +133,11 @@ impl AppState {
                     account,
                     encrypted_cookie: _,
                 } => {
-                    let name = account.username.clone();
+                    let name = if self.config.anonymize_names {
+                        "Account".to_string()
+                    } else {
+                        account.username.clone()
+                    };
                     // Avoid duplicates
                     self.store.remove_by_id(account.user_id);
                     self.store.accounts.push(*account);
@@ -228,7 +232,11 @@ impl AppState {
                     self.auto_save();
                     if !valid {
                         if let Some(acc) = self.store.find_by_id(user_id) {
-                            let label = acc.label().to_string();
+                            let label = if self.config.anonymize_names {
+                                "An account".to_string()
+                            } else {
+                                acc.label().to_string()
+                            };
                             self.toasts.push(Toast::error(format!(
                                 "Cookie expired for {label} — re-add with a fresh cookie"
                             )));
@@ -458,6 +466,7 @@ impl AppState {
                     &mut self.sidebar_state,
                     &self.store.accounts,
                     &self.selected_ids,
+                    self.config.anonymize_names,
                 );
                 self.visible_user_ids = result.visible_user_ids;
                 if let Some(a) = result.action {
@@ -536,6 +545,7 @@ impl AppState {
                     &selected_accounts,
                     &mut self.group_panel_state,
                     self.roblox_running,
+                    self.config.anonymize_names,
                 );
                 if let Some(a) = action {
                     match a {
@@ -578,6 +588,7 @@ impl AppState {
                         self.roblox_running,
                         avatar_bytes,
                         &self.config.favorite_places,
+                        self.config.anonymize_names,
                     );
                     if let Some(a) = action {
                         match a {
@@ -826,11 +837,14 @@ impl AppState {
         let Some(uid) = self.confirm_remove else {
             return;
         };
-        let label = self
-            .store
-            .find_by_id(uid)
-            .map(|a| a.label().to_string())
-            .unwrap_or_else(|| uid.to_string());
+        let label = if self.config.anonymize_names {
+            "this account".to_string()
+        } else {
+            self.store
+                .find_by_id(uid)
+                .map(|a| a.label().to_string())
+                .unwrap_or_else(|| uid.to_string())
+        };
 
         let mut keep_open = true;
         egui::Window::new("Confirm Removal")

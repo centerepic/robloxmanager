@@ -66,6 +66,7 @@ pub fn show(
     state: &mut SidebarState,
     accounts: &[Account],
     selected_ids: &HashSet<u64>,
+    anonymize: bool,
 ) -> SidebarResult {
     let mut action: Option<SidebarAction> = None;
 
@@ -145,7 +146,8 @@ pub fn show(
             .show(ui, |ui| {
                 for (filter_idx, (_, account)) in filtered.iter().enumerate() {
                     let is_selected = selected_ids.contains(&account.user_id);
-                    let has_subtitle = account.alias.is_empty()
+                    let has_subtitle = !anonymize
+                        && account.alias.is_empty()
                         && account.display_name != account.username;
                     let row_height = if has_subtitle { 36.0 } else { 24.0 };
 
@@ -195,11 +197,16 @@ pub fn show(
                     }
 
                     // Account label
+                    let display_label = if anonymize {
+                        format!("Account {}", filter_idx + 1)
+                    } else {
+                        account.label().to_string()
+                    };
                     let label_pos = egui::pos2(rect.min.x + 20.0, rect.min.y + 3.0);
                     painter.text(
                         label_pos,
                         egui::Align2::LEFT_TOP,
-                        account.label(),
+                        &display_label,
                         egui::FontId::proportional(14.0),
                         ui.style().visuals.text_color(),
                     );
@@ -261,16 +268,20 @@ pub fn show(
                                 ui.separator();
                             }
                         }
-                        ui.label(format!("@{}", account.username));
-                        ui.label(format!("ID: {}", account.user_id));
+                        if !anonymize {
+                            ui.label(format!("@{}", account.username));
+                            ui.label(format!("ID: {}", account.user_id));
+                        }
                     });
 
                     // Tooltip with presence
-                    response.on_hover_text(format!(
-                        "{} \u{2014} {}",
-                        account.username,
-                        account.last_presence.status_text()
-                    ));
+                    if !anonymize {
+                        response.on_hover_text(format!(
+                            "{} \u{2014} {}",
+                            account.username,
+                            account.last_presence.status_text()
+                        ));
+                    }
                 }
             });
     });

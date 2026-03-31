@@ -144,6 +144,25 @@ impl RobloxClient {
         Ok(bytes.to_vec())
     }
 
+    /// Convenience: perform a GET and return the response body as a string.
+    pub async fn get_text(
+        &self,
+        url: &str,
+        cookie: &str,
+    ) -> Result<String, CoreError> {
+        let resp = self.request(Method::GET, url, cookie, None).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let msg = resp.text().await.unwrap_or_default();
+            return Err(CoreError::RobloxApi {
+                status: status.as_u16(),
+                message: msg,
+            });
+        }
+        let text = resp.text().await?;
+        Ok(text)
+    }
+
     /// Convenience: perform a GET and deserialize JSON.
     pub async fn get_json<T: DeserializeOwned>(
         &self,

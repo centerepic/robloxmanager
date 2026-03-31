@@ -32,6 +32,9 @@ pub struct Account {
     /// True if the last automatic revalidation found the cookie expired.
     #[serde(default)]
     pub cookie_expired: bool,
+    /// Manual sort position (used in Custom sort mode). `u32::MAX` = not yet positioned.
+    #[serde(default = "default_sort_order")]
+    pub sort_order: u32,
 }
 
 impl Account {
@@ -47,6 +50,7 @@ impl Account {
             last_presence: Presence::default(),
             last_validated: None,
             cookie_expired: false,
+            sort_order: u32::MAX,
         }
     }
 
@@ -147,10 +151,24 @@ pub struct AppConfig {
     /// Last version the user has seen — used to detect first launch after update.
     #[serde(default)]
     pub last_seen_version: Option<String>,
+    /// Persisted sidebar sort mode: "Custom", "Name", or "Status".
+    #[serde(default = "default_sort_mode")]
+    pub sort_mode: String,
+    /// Saved private servers for quick launching.
+    #[serde(default)]
+    pub private_servers: Vec<PrivateServer>,
+}
+
+fn default_sort_mode() -> String {
+    "Custom".to_string()
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_sort_order() -> u32 {
+    u32::MAX
 }
 
 impl Default for AppConfig {
@@ -172,6 +190,8 @@ impl Default for AppConfig {
             auto_arrange_windows: false,
             anonymize_names: false,
             last_seen_version: None,
+            sort_mode: "Custom".to_string(),
+            private_servers: Vec::new(),
         }
     }
 }
@@ -198,6 +218,9 @@ impl AppConfig {
 pub struct GroupMeta {
     pub color: [u8; 3],
     pub description: String,
+    /// Manual sort position for group ordering. `u32::MAX` = not yet positioned.
+    #[serde(default = "default_sort_order")]
+    pub sort_order: u32,
 }
 
 /// A saved favorite place for quick launching.
@@ -205,4 +228,24 @@ pub struct GroupMeta {
 pub struct FavoritePlace {
     pub name: String,
     pub place_id: u64,
+}
+
+/// A saved private server for quick launching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivateServer {
+    /// User-assigned name for this private server.
+    pub name: String,
+    /// The Roblox place ID.
+    pub place_id: u64,
+    /// The universe (experience) ID — used to resolve game name and icon without auth.
+    #[serde(default)]
+    pub universe_id: Option<u64>,
+    /// The private server link code (from the URL parameter `privateServerLinkCode`).
+    pub link_code: String,
+    /// The UUID access code needed for launching (scraped from game page).
+    #[serde(default)]
+    pub access_code: String,
+    /// Resolved place name from Roblox API (cached).
+    #[serde(default)]
+    pub place_name: String,
 }

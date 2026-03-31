@@ -124,26 +124,56 @@ pub async fn fetch_presences(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PlaceDetails {
+struct UniverseDetails {
     name: String,
-    universe_id: Option<u64>,
 }
 
-/// Resolve a Place ID to its name and universe ID.
-pub async fn resolve_place(
+#[derive(Deserialize)]
+struct UniverseResponse {
+    data: Vec<UniverseDetails>,
+}
+
+/// Resolve a universe ID to its game name. Works unauthenticated.
+pub async fn resolve_universe_name(
     client: &RobloxClient,
-    cookie: &str,
-    place_id: u64,
-) -> Result<(String, Option<u64>), CoreError> {
-    let url = format!("https://games.roblox.com/v1/games/multiget-place-details?placeIds={place_id}");
-    let details: Vec<PlaceDetails> = client.get_json(&url, cookie).await?;
-    let d = details.into_iter().next().ok_or_else(|| {
-        CoreError::RobloxApi {
+    universe_id: u64,
+) -> Result<String, CoreError> {
+    let url = format!("https://games.roblox.com/v1/games?universeIds={universe_id}");
+    let resp: UniverseResponse = client.get_json(&url, "").await?;
+    resp.data
+        .into_iter()
+        .next()
+        .map(|d| d.name)
+        .ok_or_else(|| CoreError::RobloxApi {
             status: 404,
-            message: format!("place {place_id} not found"),
-        }
-    })?;
-    Ok((d.name, d.universe_id))
+            message: format!("universe {universe_id} not found"),
+        })
+}
+
+/// Fetch game icon thumbnail URLs for a batch of universe IDs.
+/// Returns a vec of `(universe_id, url)` pairs.
+pub async fn fetch_game_icons(
+    client: &RobloxClient,
+    _cookie: &str,
+    universe_ids: &[u64],
+) -> Result<Vec<(u64, String)>, CoreError> {
+    if universe_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let ids: Vec<String> = universe_ids.iter().map(|id| id.to_string()).collect();
+    let ids_param = ids.join(",");
+    let url = format!(
+        "https://thumbnails.roblox.com/v1/games/icons\
+         ?universeIds={ids_param}&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false"
+    );
+
+    let resp: ThumbnailResponse = client.get_json(&url, "").await?;
+
+    Ok(universe_ids
+        .iter()
+        .zip(resp.data.iter())
+        .filter_map(|(id, entry)| entry.image_url.clone().map(|url| (*id, url)))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +212,101 @@ pub async fn fetch_servers(
     }
     let resp: ServerListResponse = client.get_json(&url, cookie).await?;
     Ok((resp.data, resp.next_page_cursor))
+}
+
+// ---------------------------------------------------------------------------
+// Share link resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a Roblox share link code (from `/share?code=CODE&type=Server`)
+/// into `(place_id, universe_id, link_code, access_code)`.
+///
+/// Two-step process:
+/// 1. POST `apis.roblox.com/sharelinks/v1/resolve-link` to get placeId + linkCode.
+/// 2. GET `/games/{placeId}/game?privateServerLinkCode={linkCode}` and scrape
+///    the UUID access code from the `joinPrivateGame(...)` JS call.
+pub async fn resolve_share_link(
+    client: &RobloxClient,
+    cookie: &str,
+    share_code: &str,
+) -> Result<(u64, Option<u64>, String, String), CoreError> {
+    use regex::Regex;
+
+    // --- Step 1: Resolve share code → placeId + linkCode via API ---
+    let body = serde_json::json!({
+        "linkId": share_code,
+        "linkType": "Server",
+    });
+    let resp: serde_json::Value = client
+        .post_json(
+            "https://apis.roblox.com/sharelinks/v1/resolve-link",
+            cookie,
+            Some(&body),
+        )
+        .await?;
+
+    let ps_data = resp
+        .get("privateServerInviteData")
+        .ok_or_else(|| CoreError::RobloxApi {
+            status: 400,
+            message: "share link response missing privateServerInviteData".into(),
+        })?;
+
+    let place_id = ps_data
+        .get("placeId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| CoreError::RobloxApi {
+            status: 400,
+            message: "share link response missing placeId".into(),
+        })?;
+
+    let link_code = ps_data
+        .get("linkCode")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CoreError::RobloxApi {
+            status: 400,
+            message: "share link response missing linkCode".into(),
+        })?
+        .to_string();
+
+    let universe_id = ps_data.get("universeId").and_then(|v| v.as_u64());
+
+    let status = ps_data
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    if status != "Valid" {
+        return Err(CoreError::RobloxApi {
+            status: 400,
+            message: format!("private server invite status: {status}"),
+        });
+    }
+
+    tracing::info!("Share link resolved → placeId={place_id}, linkCode={link_code}");
+
+    // --- Step 2: Scrape accessCode (UUID) from the game page ---
+    let game_url = format!(
+        "https://www.roblox.com/games/{place_id}/game?privateServerLinkCode={link_code}"
+    );
+    let html = client.get_text(&game_url, cookie).await?;
+
+    let access_re = Regex::new(
+        r"Roblox\.GameLauncher\.joinPrivateGame\(\d+\s*,\s*'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'"
+    ).expect("invalid regex");
+
+    let access_code = access_re
+        .captures(&html)
+        .and_then(|cap| cap.get(1))
+        .ok_or_else(|| CoreError::RobloxApi {
+            status: 400,
+            message: "could not scrape accessCode from game page".into(),
+        })?
+        .as_str()
+        .to_string();
+
+    tracing::info!("Access code resolved → {access_code}");
+
+    Ok((place_id, universe_id, link_code, access_code))
 }
 
 // ---------------------------------------------------------------------------

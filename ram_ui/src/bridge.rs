@@ -4,6 +4,7 @@
 //! as [`BackendCommand`] messages to a background `tokio` runtime. Results come
 //! back as [`BackendEvent`] through an mpsc channel polled each frame.
 
+use eframe::egui;
 use ram_core::auth::RobloxClient;
 use ram_core::models::{Account, AccountStore, Presence};
 use ram_core::{api, crypto, process, CoreError};
@@ -34,6 +35,8 @@ pub enum BackendCommand {
         cookie: String,
         place_id: u64,
         job_id: Option<String>,
+        link_code: Option<String>,
+        access_code: Option<String>,
         multi_instance: bool,
         kill_background: bool,
         privacy_mode: bool,
@@ -46,6 +49,8 @@ pub enum BackendCommand {
         use_credential_manager: bool,
         place_id: u64,
         job_id: Option<String>,
+        link_code: Option<String>,
+        access_code: Option<String>,
         multi_instance: bool,
         kill_background: bool,
         privacy_mode: bool,
@@ -85,6 +90,8 @@ pub enum BackendCommand {
         use_credential_manager: bool,
         place_id: u64,
         job_id: Option<String>,
+        link_code: Option<String>,
+        access_code: Option<String>,
         multi_instance: bool,
         kill_background: bool,
         privacy_mode: bool,
@@ -100,6 +107,23 @@ pub enum BackendCommand {
     ArrangeWindows,
     /// Check GitHub for a newer release.
     CheckForUpdates { current_version: String },
+    /// Resolve a place ID to its name (for private server auto-check).
+    ResolvePlace {
+        place_id: u64,
+        universe_id: Option<u64>,
+        /// Index into the private_servers list so the UI can update the right entry.
+        index: usize,
+    },
+    /// Resolve a share link code into (place_id, link_code) via the Roblox API.
+    ResolveShareLink {
+        share_code: String,
+        server_name: String,
+        /// The encrypted cookie + auth info needed for the authenticated API call.
+        first_user_id: u64,
+        encrypted_cookie: Option<String>,
+        password: String,
+        use_credential_manager: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +170,23 @@ pub enum BackendEvent {
     WindowsArranged,
     /// A newer version is available on GitHub.
     UpdateAvailable { version: String, url: String },
+    /// Place name resolved for a private server entry.
+    PlaceResolved {
+        index: usize,
+        place_name: String,
+        place_id: u64,
+        icon_bytes: Option<Vec<u8>>,
+    },
+    /// Share link resolved — contains the actual place_id, link_code, access_code, and server name.
+    ShareLinkResolved {
+        server_name: String,
+        place_id: u64,
+        universe_id: Option<u64>,
+        link_code: String,
+        access_code: String,
+    },
+    /// Share link resolution failed.
+    ShareLinkFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +196,7 @@ pub enum BackendEvent {
 pub struct BackendBridge {
     pub cmd_tx: mpsc::UnboundedSender<BackendCommand>,
     pub evt_rx: mpsc::UnboundedReceiver<BackendEvent>,
+    repaint_ctx: Option<egui::Context>,
 }
 
 impl BackendBridge {
@@ -171,7 +213,14 @@ impl BackendBridge {
             rt.block_on(backend_loop(cmd_rx, evt_tx));
         });
 
-        Self { cmd_tx, evt_rx }
+        Self { cmd_tx, evt_rx, repaint_ctx: None }
+    }
+
+    /// Give the bridge an egui context so it can request repaints when events arrive.
+    pub fn set_repaint_ctx(&mut self, ctx: egui::Context) {
+        if self.repaint_ctx.is_none() {
+            self.repaint_ctx = Some(ctx);
+        }
     }
 
     /// Send a command to the backend (non-blocking).
@@ -184,6 +233,11 @@ impl BackendBridge {
         let mut events = Vec::new();
         while let Ok(evt) = self.evt_rx.try_recv() {
             events.push(evt);
+        }
+        if !events.is_empty() {
+            if let Some(ctx) = &self.repaint_ctx {
+                ctx.request_repaint();
+            }
         }
         events
     }
@@ -278,6 +332,8 @@ async fn handle_command(
             use_credential_manager,
             place_id,
             job_id,
+            link_code,
+            access_code,
             multi_instance,
             kill_background,
             privacy_mode,
@@ -300,13 +356,15 @@ async fn handle_command(
                 process::clear_roblox_cookies();
             }
             let ticket = client.generate_auth_ticket(&cookie).await?;
-            process::launch_game(&ticket, place_id, job_id.as_deref())?;
+            process::launch_game(&ticket, place_id, job_id.as_deref(), link_code.as_deref(), access_code.as_deref())?;
             Ok(BackendEvent::GameLaunched)
         }
         BackendCommand::LaunchGame {
             cookie,
             place_id,
             job_id,
+            link_code,
+            access_code,
             multi_instance,
             kill_background,
             privacy_mode,
@@ -321,7 +379,7 @@ async fn handle_command(
                 process::clear_roblox_cookies();
             }
             let ticket = client.generate_auth_ticket(&cookie).await?;
-            process::launch_game(&ticket, place_id, job_id.as_deref())?;
+            process::launch_game(&ticket, place_id, job_id.as_deref(), link_code.as_deref(), access_code.as_deref())?;
             Ok(BackendEvent::GameLaunched)
         }
         BackendCommand::SaveStore {
@@ -389,6 +447,8 @@ async fn handle_command(
             use_credential_manager,
             place_id,
             job_id,
+            link_code,
+            access_code,
             multi_instance,
             kill_background,
             privacy_mode,
@@ -403,9 +463,9 @@ async fn handle_command(
                 process::clear_roblox_cookies();
             }
 
-            // If no Job ID was provided, resolve one so all accounts land in
-            // the same server.  Use the first account's cookie for the API call.
-            let resolved_job_id = if job_id.is_some() {
+            // If no Job ID was provided and no link_code (private server), resolve
+            // a public server so all accounts land in the same server.
+            let resolved_job_id = if job_id.is_some() || link_code.is_some() {
                 job_id
             } else {
                 // Decrypt the first account's cookie to make the API call
@@ -464,6 +524,8 @@ async fn handle_command(
                                     &ticket,
                                     place_id,
                                     resolved_job_id.as_deref(),
+                                    link_code.as_deref(),
+                                    access_code.as_deref(),
                                 ) {
                                     error!("Bulk launch failed for user {user_id}: {e}");
                                     failed += 1;
@@ -549,6 +611,63 @@ async fn handle_command(
                 Err(e) => {
                     info!("Update check failed (non-fatal): {e}");
                     Ok(BackendEvent::StoreSaved) // silently ignore
+                }
+            }
+        }
+        BackendCommand::ResolvePlace { place_id, universe_id, index } => {
+            // Both the game name and icon endpoints work without auth when we
+            // have a universe_id. If we don't, we can't resolve without auth.
+            if let Some(uid) = universe_id {
+                let name = api::resolve_universe_name(client, uid).await
+                    .unwrap_or_default();
+                let icon_bytes = match api::fetch_game_icons(client, "", &[uid]).await {
+                    Ok(icons) => {
+                        if let Some((_, url)) = icons.into_iter().next() {
+                            client.get_bytes(&url, "").await.ok()
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        info!("Game icon fetch failed for universe {uid}: {e}");
+                        None
+                    }
+                };
+                Ok(BackendEvent::PlaceResolved { index, place_name: name, place_id, icon_bytes })
+            } else {
+                // No universe_id — cannot resolve without auth. Return empty.
+                Ok(BackendEvent::PlaceResolved { index, place_name: String::new(), place_id, icon_bytes: None })
+            }
+        }
+        BackendCommand::ResolveShareLink {
+            share_code,
+            server_name,
+            first_user_id,
+            encrypted_cookie,
+            password,
+            use_credential_manager,
+        } => {
+            let cookie = if use_credential_manager {
+                crypto::credential_load(first_user_id)?
+            } else {
+                let enc = encrypted_cookie.ok_or_else(|| {
+                    CoreError::Crypto("no encrypted cookie for share link resolution".into())
+                })?;
+                crypto::decrypt_cookie(&enc, &password)?
+            };
+            match api::resolve_share_link(client, &cookie, &share_code).await {
+                Ok((place_id, universe_id, link_code, access_code)) => {
+                    Ok(BackendEvent::ShareLinkResolved {
+                        server_name,
+                        place_id,
+                        universe_id,
+                        link_code,
+                        access_code,
+                    })
+                }
+                Err(e) => {
+                    info!("ResolveShareLink failed: {e}");
+                    Ok(BackendEvent::ShareLinkFailed(e.to_string()))
                 }
             }
         }

@@ -2,12 +2,12 @@
 //! the sidebar, main panel, settings, toast system, and backend bridge together.
 
 use eframe::egui;
-use ram_core::models::{AccountStore, AppConfig};
+use ram_core::models::{AccountStore, AppConfig, PrivateServer};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::bridge::{BackendBridge, BackendCommand, BackendEvent};
-use crate::components::{group_panel, main_panel, settings, sidebar};
+use crate::components::{group_panel, main_panel, private_servers, settings, sidebar, tutorial};
 use crate::toast::{Toast, Toasts};
 
 // ---------------------------------------------------------------------------
@@ -17,6 +17,7 @@ use crate::toast::{Toast, Toasts};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Accounts,
+    PrivateServers,
     Settings,
 }
 
@@ -55,11 +56,15 @@ pub struct AppState {
     sidebar_state: sidebar::SidebarState,
     main_panel_state: main_panel::MainPanelState,
     group_panel_state: group_panel::GroupPanelState,
+    private_servers_state: private_servers::PrivateServerState,
     settings_state: settings::SettingsState,
     add_dialog: AddAccountDialog,
 
     /// Downloaded avatar image bytes, keyed by user ID.
     avatar_bytes: HashMap<u64, Vec<u8>>,
+
+    /// Downloaded game icon bytes, keyed by place ID.
+    game_icon_bytes: HashMap<u64, Vec<u8>>,
 
     /// User IDs currently visible in the sidebar (after search filtering).
     visible_user_ids: Vec<u64>,
@@ -80,6 +85,9 @@ pub struct AppState {
     update_available: Option<(String, String)>,
     /// Show the "What's New" changelog window.
     show_changelog: bool,
+
+    /// Interactive first-launch tutorial.
+    tutorial: tutorial::TutorialState,
 }
 
 impl AppState {
@@ -105,6 +113,13 @@ impl AppState {
             }
         }
 
+        let mut sidebar_state = sidebar::SidebarState::default();
+        sidebar_state.sort_order = match config.sort_mode.as_str() {
+            "Name" => sidebar::SortOrder::Name,
+            "Status" => sidebar::SortOrder::Status,
+            _ => sidebar::SortOrder::Custom,
+        };
+
         let mut state = Self {
             config,
             config_path,
@@ -114,12 +129,14 @@ impl AppState {
             toasts: Toasts::default(),
             active_tab: Tab::Accounts,
             selected_ids: HashSet::new(),
-            sidebar_state: sidebar::SidebarState::default(),
+            sidebar_state,
             main_panel_state: main_panel::MainPanelState::default(),
             group_panel_state: group_panel::GroupPanelState::default(),
+            private_servers_state: private_servers::PrivateServerState::default(),
             settings_state: settings::SettingsState::default(),
             add_dialog: AddAccountDialog::default(),
             avatar_bytes: HashMap::new(),
+            game_icon_bytes: HashMap::new(),
             visible_user_ids: Vec::new(),
             roblox_running: false,
             frame_count: 0,
@@ -128,6 +145,7 @@ impl AppState {
             confirm_remove: None,
             update_available: None,
             show_changelog: false,
+            tutorial: tutorial::TutorialState::default(),
         };
 
         // Check for updates on startup
@@ -135,12 +153,20 @@ impl AppState {
             current_version: env!("CARGO_PKG_VERSION").to_string(),
         });
 
+        // Resolve game icons for saved private servers
+        state.resolve_private_server_icons();
+
         // Detect first launch after update
         let current = env!("CARGO_PKG_VERSION");
         let is_new_version = state.config.last_seen_version.as_deref() != Some(current);
         if is_new_version && state.config.last_seen_version.is_some() {
             // Upgraded from a previous version — show changelog
             state.show_changelog = true;
+        }
+        // True first launch — show the tutorial (but not if an accounts file
+        // already exists, which means an existing user just lost their config).
+        if state.config.last_seen_version.is_none() && !state.needs_unlock {
+            state.tutorial = tutorial::TutorialState::start();
         }
         // Always update the stored version
         state.config.last_seen_version = Some(current.to_string());
@@ -169,6 +195,7 @@ impl AppState {
                     self.toasts.push(Toast::success(format!("Added {name}")));
                     self.add_dialog.loading = false;
                     self.add_dialog.last_error = None;
+                    self.tutorial.advance_from(tutorial::TutorialStep::EnterCookie);
                     self.auto_save();
                 }
                 BackendEvent::AccountRemoved { user_id } => {
@@ -279,6 +306,50 @@ impl AppState {
                 BackendEvent::UpdateAvailable { version, url } => {
                     self.update_available = Some((version, url));
                 }
+                BackendEvent::PlaceResolved { index, place_name, place_id, icon_bytes } => {
+                    if let Some(server) = self.config.private_servers.get_mut(index) {
+                        // Only update place_name if the new one is non-empty
+                        // (don't overwrite good cached data on transient failures).
+                        if !place_name.is_empty() {
+                            server.place_name = place_name;
+                            let _ = self.config.save(&self.config_path);
+                        }
+                    }
+                    if let Some(bytes) = icon_bytes {
+                        self.game_icon_bytes.insert(place_id, bytes);
+                    }
+                }
+                BackendEvent::ShareLinkResolved {
+                    server_name,
+                    place_id,
+                    universe_id,
+                    link_code,
+                    access_code,
+                } => {
+                    let server = PrivateServer {
+                        name: server_name,
+                        place_id,
+                        universe_id,
+                        link_code,
+                        access_code,
+                        place_name: String::new(),
+                    };
+                    let idx = self.config.private_servers.len();
+                    self.config.private_servers.push(server);
+                    let _ = self.config.save(&self.config_path);
+                    // Auto-resolve the place name and icon
+                    self.bridge.send(BackendCommand::ResolvePlace {
+                        place_id,
+                        universe_id,
+                        index: idx,
+                    });
+                    self.toasts.push(Toast::success("Share link resolved — private server added"));
+                }
+                BackendEvent::ShareLinkFailed(msg) => {
+                    self.toasts.push(Toast::error(format!(
+                        "Failed to resolve share link: {msg}"
+                    )));
+                }
             }
         }
     }
@@ -333,6 +404,19 @@ impl AppState {
         }
     }
 
+    /// Resolve place names and game icons for private servers that are missing them.
+    fn resolve_private_server_icons(&self) {
+        for (i, server) in self.config.private_servers.iter().enumerate() {
+            if server.place_name.is_empty() || !self.game_icon_bytes.contains_key(&server.place_id) {
+                self.bridge.send(BackendCommand::ResolvePlace {
+                    place_id: server.place_id,
+                    universe_id: server.universe_id,
+                    index: i,
+                });
+            }
+        }
+    }
+
     /// Revalidate all account cookies in the background.
     fn trigger_revalidation(&self) {
         if self.store.accounts.is_empty() {
@@ -359,6 +443,8 @@ impl AppState {
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count += 1;
+        // Ensure the bridge can wake the UI when async events arrive.
+        self.bridge.set_repaint_ctx(ctx.clone());
         self.process_events();
 
         // Periodically refresh roblox_running flag (every ~120 frames ≈ 2s)
@@ -427,6 +513,7 @@ impl eframe::App for AppState {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Accounts, "📋 Accounts");
+                ui.selectable_value(&mut self.active_tab, Tab::PrivateServers, "🔒 Private Servers");
                 ui.selectable_value(&mut self.active_tab, Tab::Settings, "⚙ Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some((ref version, ref url)) = self.update_available {
@@ -470,6 +557,7 @@ impl eframe::App for AppState {
 
         match self.active_tab {
             Tab::Accounts => self.show_accounts_tab(ctx),
+            Tab::PrivateServers => self.show_private_servers_tab(ctx),
             Tab::Settings => self.show_settings_tab(ctx),
         }
 
@@ -481,6 +569,9 @@ impl eframe::App for AppState {
 
         // ---- Changelog window ----
         self.show_changelog_window(ctx);
+
+        // ---- First-launch tutorial overlay ----
+        tutorial::show_overlay(ctx, &mut self.tutorial);
 
         // ---- Toasts ----
         self.toasts.show(ctx);
@@ -505,9 +596,16 @@ impl AppState {
                     &self.store.accounts,
                     &self.selected_ids,
                     self.config.anonymize_names,
+                    &self.config.groups,
                 );
                 self.visible_user_ids = result.visible_user_ids;
-                if let Some(a) = result.action {
+                self.tutorial.add_btn_rect = result.add_btn_rect;
+                self.tutorial.sidebar_accounts_rect = result.accounts_rect;
+                // Tutorial: advance when the sidebar account list area is known
+                if !self.selected_ids.is_empty() {
+                    self.tutorial.advance_from(tutorial::TutorialStep::SelectAccount);
+                }
+                for a in result.actions {
                     match a {
                         sidebar::SidebarAction::Select(id) => {
                             self.selected_ids.clear();
@@ -531,6 +629,7 @@ impl AppState {
                             self.add_dialog.last_error = None;
                             self.add_dialog.loading = false;
                             self.add_dialog.password_input = self.master_password.clone();
+                            self.tutorial.advance_from(tutorial::TutorialStep::AddAccount);
                         }
                         sidebar::SidebarAction::CopyJobId(job_id) => {
                             ui.output_mut(|o| o.copied_text = job_id.clone());
@@ -553,6 +652,8 @@ impl AppState {
                                         use_credential_manager: self.config.use_credential_manager,
                                         place_id,
                                         job_id: None,
+                                        link_code: None,
+                                        access_code: None,
                                         multi_instance: self.config.multi_instance_enabled,
                                         kill_background: self.config.kill_background_roblox,
                                         privacy_mode: self.config.privacy_mode,
@@ -564,7 +665,138 @@ impl AppState {
                                 ));
                             }
                         }
+                        sidebar::SidebarAction::AssignGroup { user_ids, group } => {
+                            for uid in &user_ids {
+                                if let Some(acc) = self.store.find_by_id_mut(*uid) {
+                                    acc.group = group.clone();
+                                }
+                            }
+                            self.auto_save();
+                        }
+                        sidebar::SidebarAction::CreateGroup { name, color, assign_user_ids } => {
+                            self.config.groups.insert(
+                                name.clone(),
+                                ram_core::models::GroupMeta {
+                                    color,
+                                    description: String::new(),
+                                    sort_order: u32::MAX,
+                                },
+                            );
+                            for uid in &assign_user_ids {
+                                if let Some(acc) = self.store.find_by_id_mut(*uid) {
+                                    acc.group = name.clone();
+                                }
+                            }
+                            let _ = self.config.save(&self.config_path);
+                            self.auto_save();
+                        }
+                        sidebar::SidebarAction::DeleteGroup(name) => {
+                            self.config.groups.remove(&name);
+                            for acc in &mut self.store.accounts {
+                                if acc.group == name {
+                                    acc.group = String::new();
+                                }
+                            }
+                            self.sidebar_state.collapsed_groups.remove(&name);
+                            let _ = self.config.save(&self.config_path);
+                            self.auto_save();
+                        }
+                        sidebar::SidebarAction::EditGroup { old_name, new_name, color } => {
+                            let old_meta = self.config.groups.remove(&old_name);
+                            let desc = old_meta.as_ref().map(|m| m.description.clone()).unwrap_or_default();
+                            let old_sort = old_meta.map(|m| m.sort_order).unwrap_or(u32::MAX);
+                            self.config.groups.insert(
+                                new_name.clone(),
+                                ram_core::models::GroupMeta {
+                                    color,
+                                    description: desc,
+                                    sort_order: old_sort,
+                                },
+                            );
+                            if old_name != new_name {
+                                for acc in &mut self.store.accounts {
+                                    if acc.group == old_name {
+                                        acc.group = new_name.clone();
+                                    }
+                                }
+                                if self.sidebar_state.collapsed_groups.remove(&old_name) {
+                                    self.sidebar_state
+                                        .collapsed_groups
+                                        .insert(new_name.clone());
+                                }
+                            }
+                            let _ = self.config.save(&self.config_path);
+                            self.auto_save();
+                        }
+                        sidebar::SidebarAction::ReorderAccount { user_id, target_user_id, insert_after } => {
+                            // Move `user_id` before or after `target_user_id` within the
+                            // same group (or both ungrouped). Reassign sort_order values.
+                            let group = self.store.find_by_id(user_id)
+                                .map(|a| a.group.clone())
+                                .unwrap_or_default();
+                            // Collect accounts in this group, sorted by current sort_order then name.
+                            let mut peers: Vec<(u32, String, u64)> = self.store.accounts.iter()
+                                .filter(|a| a.group == group)
+                                .map(|a| (a.sort_order, a.label().to_lowercase(), a.user_id))
+                                .collect();
+                            peers.sort();
+                            let mut ids: Vec<u64> = peers.into_iter().map(|(_, _, id)| id).collect();
+                            // Remove the dragged account.
+                            if let Some(drag_pos) = ids.iter().position(|id| *id == user_id) {
+                                ids.remove(drag_pos);
+                            }
+                            // Find target and insert before or after it.
+                            let target_pos = ids.iter().position(|id| *id == target_user_id)
+                                .unwrap_or(ids.len());
+                            let insert_pos = if insert_after { target_pos + 1 } else { target_pos };
+                            ids.insert(insert_pos.min(ids.len()), user_id);
+                            // Reassign sequential sort_order values.
+                            for (i, uid) in ids.iter().enumerate() {
+                                if let Some(acc) = self.store.find_by_id_mut(*uid) {
+                                    acc.sort_order = i as u32;
+                                }
+                            }
+                            self.auto_save();
+                        }
+                        sidebar::SidebarAction::ReorderGroup { group_name, target_group, insert_after } => {
+                            // Move `group_name` before or after `target_group`.
+                            let mut ordered: Vec<(u32, String)> = self.config.groups.iter()
+                                .map(|(name, meta)| (meta.sort_order, name.clone()))
+                                .collect();
+                            ordered.sort();
+                            let mut names: Vec<String> = ordered.into_iter().map(|(_, n)| n).collect();
+                            if let Some(pos) = names.iter().position(|n| *n == group_name) {
+                                names.remove(pos);
+                            }
+                            let target_pos = names.iter().position(|n| *n == target_group)
+                                .unwrap_or(names.len());
+                            let insert_pos = if insert_after { target_pos + 1 } else { target_pos };
+                            names.insert(insert_pos.min(names.len()), group_name);
+                            for (i, name) in names.iter().enumerate() {
+                                if let Some(meta) = self.config.groups.get_mut(name) {
+                                    meta.sort_order = i as u32;
+                                }
+                            }
+                            let _ = self.config.save(&self.config_path);
+                        }
+                        sidebar::SidebarAction::ResetCustomOrder => {
+                            // Clear all custom sort_order values.
+                            for acc in &mut self.store.accounts {
+                                acc.sort_order = u32::MAX;
+                            }
+                            for meta in self.config.groups.values_mut() {
+                                meta.sort_order = u32::MAX;
+                            }
+                            let _ = self.config.save(&self.config_path);
+                            self.auto_save();
+                        }
                     }
+                }
+                // Persist sort mode if it changed.
+                let current_mode = self.sidebar_state.sort_order.to_string();
+                if self.config.sort_mode != current_mode {
+                    self.config.sort_mode = current_mode;
+                    let _ = self.config.save(&self.config_path);
                 }
             });
 
@@ -601,6 +833,8 @@ impl AppState {
                                 use_credential_manager: self.config.use_credential_manager,
                                 place_id,
                                 job_id,
+                                link_code: None,
+                                access_code: None,
                                 multi_instance: self.config.multi_instance_enabled,
                                 kill_background: self.config.kill_background_roblox,
                                 privacy_mode: self.config.privacy_mode,
@@ -619,7 +853,7 @@ impl AppState {
                 let account = self.store.find_by_id(id).cloned();
                 if let Some(account) = account {
                     let avatar_bytes = self.avatar_bytes.get(&account.user_id);
-                    let action = main_panel::show(
+                    let result = main_panel::show(
                         ui,
                         &account,
                         &mut self.main_panel_state,
@@ -628,7 +862,8 @@ impl AppState {
                         &self.config.favorite_places,
                         self.config.anonymize_names,
                     );
-                    if let Some(a) = action {
+                    self.tutorial.launch_btn_rect = result.launch_btn_rect;
+                    if let Some(a) = result.action {
                         match a {
                             main_panel::MainPanelAction::LaunchGame { place_id, job_id } => {
                                 self.bridge.send(BackendCommand::LaunchGameEncrypted {
@@ -638,6 +873,8 @@ impl AppState {
                                     use_credential_manager: self.config.use_credential_manager,
                                     place_id,
                                     job_id,
+                                    link_code: None,
+                                    access_code: None,
                                     multi_instance: self.config.multi_instance_enabled,
                                     kill_background: self.config.kill_background_roblox,
                                     privacy_mode: self.config.privacy_mode,
@@ -698,6 +935,115 @@ impl AppState {
             {
                 let uid = *self.selected_ids.iter().next().unwrap();
                 self.confirm_remove = Some(uid);
+            }
+        });
+    }
+
+    fn show_private_servers_tab(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let has_selection = !self.selected_ids.is_empty();
+            let action = private_servers::show(
+                ui,
+                &mut self.private_servers_state,
+                &self.config.private_servers,
+                has_selection,
+                &self.game_icon_bytes,
+            );
+            if let Some(a) = action {
+                match a {
+                    private_servers::PrivateServerAction::Add(server) => {
+                        let idx = self.config.private_servers.len();
+                        let place_id = server.place_id;
+                        let universe_id = server.universe_id;
+                        self.config.private_servers.push(server);
+                        let _ = self.config.save(&self.config_path);
+                        // Auto-resolve the place name
+                        self.bridge.send(BackendCommand::ResolvePlace {
+                            place_id,
+                            universe_id,
+                            index: idx,
+                        });
+                        self.toasts.push(Toast::success("Private server added"));
+                    }
+                    private_servers::PrivateServerAction::Remove(idx) => {
+                        if idx < self.config.private_servers.len() {
+                            self.config.private_servers.remove(idx);
+                            let _ = self.config.save(&self.config_path);
+                            self.toasts.push(Toast::info("Private server removed"));
+                        }
+                    }
+                    private_servers::PrivateServerAction::Launch { place_id, link_code, access_code } => {
+                        let ac = if access_code.is_empty() { None } else { Some(access_code.clone()) };
+                        if self.selected_ids.len() == 1 {
+                            let uid = *self.selected_ids.iter().next().unwrap();
+                            if let Some(acc) = self.store.find_by_id(uid) {
+                                self.bridge.send(BackendCommand::LaunchGameEncrypted {
+                                    user_id: acc.user_id,
+                                    encrypted_cookie: acc.encrypted_cookie.clone(),
+                                    password: self.master_password.clone(),
+                                    use_credential_manager: self.config.use_credential_manager,
+                                    place_id,
+                                    job_id: None,
+                                    link_code: Some(link_code.clone()),
+                                    access_code: ac.clone(),
+                                    multi_instance: self.config.multi_instance_enabled,
+                                    kill_background: self.config.kill_background_roblox,
+                                    privacy_mode: self.config.privacy_mode,
+                                });
+                            }
+                        } else if self.selected_ids.len() > 1 {
+                            let accounts: Vec<(u64, Option<String>)> = self
+                                .store
+                                .accounts
+                                .iter()
+                                .filter(|a| self.selected_ids.contains(&a.user_id))
+                                .map(|a| (a.user_id, a.encrypted_cookie.clone()))
+                                .collect();
+                            self.bridge.send(BackendCommand::BulkLaunchEncrypted {
+                                accounts,
+                                password: self.master_password.clone(),
+                                use_credential_manager: self.config.use_credential_manager,
+                                place_id,
+                                job_id: None,
+                                link_code: Some(link_code),
+                                access_code: ac,
+                                multi_instance: self.config.multi_instance_enabled,
+                                kill_background: self.config.kill_background_roblox,
+                                privacy_mode: self.config.privacy_mode,
+                            });
+                        }
+                    }
+                    private_servers::PrivateServerAction::Resolve(idx) => {
+                        if let Some(server) = self.config.private_servers.get(idx) {
+                            self.bridge.send(BackendCommand::ResolvePlace {
+                                place_id: server.place_id,
+                                universe_id: server.universe_id,
+                                index: idx,
+                            });
+                        }
+                    }
+                    private_servers::PrivateServerAction::ResolveShareLink {
+                        share_code,
+                        server_name,
+                    } => {
+                        // Need an authenticated account to resolve share links
+                        if let Some(acc) = self.store.accounts.first() {
+                            self.bridge.send(BackendCommand::ResolveShareLink {
+                                share_code,
+                                server_name,
+                                first_user_id: acc.user_id,
+                                encrypted_cookie: acc.encrypted_cookie.clone(),
+                                password: self.master_password.clone(),
+                                use_credential_manager: self.config.use_credential_manager,
+                            });
+                            self.toasts.push(Toast::info("Resolving share link..."));
+                        } else {
+                            self.toasts.push(Toast::error(
+                                "Add at least one account before using share links",
+                            ));
+                        }
+                    }
+                }
             }
         });
     }
@@ -806,7 +1152,8 @@ impl AppState {
                 let cookie_edit = egui::TextEdit::multiline(&mut self.add_dialog.cookie_input)
                     .desired_rows(3)
                     .hint_text("_|WARNING:-DO-NOT-SHARE-THIS...");
-                ui.add_enabled(!self.add_dialog.loading, cookie_edit);
+                let cookie_resp = ui.add_enabled(!self.add_dialog.loading, cookie_edit);
+                self.tutorial.cookie_field_rect = cookie_resp.rect;
                 ui.add_space(8.0);
 
                 // Always show password field — uses a staging buffer so

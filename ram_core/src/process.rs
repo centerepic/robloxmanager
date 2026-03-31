@@ -57,26 +57,45 @@ pub fn clear_roblox_cookies() {
 /// `ticket` — the rbx-authentication-ticket from [`crate::auth::RobloxClient`].
 /// `place_id` — numeric Roblox place ID.
 /// `job_id` — optional server Job ID for joining a specific server.
+/// `link_code` — optional private server link code.
+/// `access_code` — optional UUID access code for private servers.
 pub fn launch_game(
     ticket: &str,
     place_id: u64,
     job_id: Option<&str>,
+    link_code: Option<&str>,
+    access_code: Option<&str>,
 ) -> Result<(), CoreError> {
     let browser_tracker_id: u64 = rand::random::<u64>() % 1_000_000_000;
     let timestamp = chrono::Utc::now().timestamp_millis();
+
+    let request_type = if link_code.is_some() {
+        "RequestPrivateGame"
+    } else {
+        "RequestGame"
+    };
 
     let mut uri = format!(
         "roblox-player:1+launchmode:play\
          +gameinfo:{ticket}\
          +launchtime:{timestamp}\
          +placelauncherurl:https%3A%2F%2Fassetgame.roblox.com%2Fgame%2FPlaceLauncher.ashx\
-         %3Frequest%3DRequestGame\
+         %3Frequest%3D{request_type}\
          %26browserTrackerId%3D{browser_tracker_id}\
          %26placeId%3D{place_id}\
          %26isPlayTogetherGame%3Dfalse"
     );
     if let Some(jid) = job_id {
         uri.push_str(&format!("%26gameId%3D{jid}"));
+    }
+    if let Some(ac) = access_code {
+        uri.push_str(&format!("%26accessCode%3D{ac}"));
+    } else if let Some(code) = link_code {
+        // Fallback: use linkCode as accessCode for old-format URLs.
+        uri.push_str(&format!("%26accessCode%3D{code}"));
+    }
+    if let Some(lc) = link_code {
+        uri.push_str(&format!("%26linkCode%3D{lc}"));
     }
 
     info!("Launching game - place {place_id}");

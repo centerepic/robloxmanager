@@ -1,13 +1,57 @@
-//! Left sidebar — account list, search/filter, status indicators.
+//! Left sidebar — account list, search/filter, status indicators, account grouping.
 //! Supports multi-select via Ctrl+click (toggle) and Shift+click (range).
+//! Accounts are organized into groups via drag-and-drop:
+//!   - Drag an account onto another ungrouped account → prompt to create a group.
+//!   - Drag an account onto a group header → add it to that group.
+//!   - Groups are collapsible, colored containers that visually encapsulate their accounts.
 
 use eframe::egui;
-use ram_core::models::Account;
-use std::collections::HashSet;
+use ram_core::models::{Account, GroupMeta};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
+/// Stable 5-character anonymized tag derived from a user ID.
+fn anon_tag(user_id: u64) -> String {
+    let mut h = std::hash::DefaultHasher::new();
+    user_id.hash(&mut h);
+    let hash = h.finish();
+    // Base-36 encoding of the lower bits, truncated to 5 chars
+    let mut buf = String::with_capacity(5);
+    let mut val = hash;
+    for _ in 0..5 {
+        let digit = (val % 36) as u8;
+        buf.push(if digit < 10 { (b'0' + digit) as char } else { (b'a' + digit - 10) as char });
+        val /= 36;
+    }
+    buf
+}
+
+/// Preset colors offered when creating/editing a group.
+const GROUP_PRESETS: &[([u8; 3], &str)] = &[
+    ([220, 60, 60], "Red"),
+    ([60, 180, 60], "Green"),
+    ([60, 120, 220], "Blue"),
+    ([220, 180, 50], "Yellow"),
+    ([160, 60, 220], "Purple"),
+    ([60, 200, 200], "Cyan"),
+    ([220, 130, 50], "Orange"),
+    ([220, 80, 160], "Pink"),
+];
+
+/// Payload carried during drag-and-drop.
+#[derive(Clone)]
+enum DragPayload {
+    /// Dragging an account row.
+    Account { user_id: u64, label: String },
+    /// Dragging a group header.
+    Group { name: String },
+}
 
 /// Sort order for the account list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SortOrder {
+    /// Manual drag-to-reorder (persisted via `sort_order` fields).
+    Custom,
     Name,
     Status,
 }
@@ -15,18 +59,35 @@ pub enum SortOrder {
 impl std::fmt::Display for SortOrder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SortOrder::Custom => write!(f, "Custom"),
             SortOrder::Name => write!(f, "Name"),
             SortOrder::Status => write!(f, "Status"),
         }
     }
 }
 
+/// State for the group editor popup (create or edit).
+pub struct GroupEditorState {
+    pub name: String,
+    pub color: [u8; 3],
+    /// `None` = creating new group, `Some(old_name)` = editing existing.
+    pub original_name: Option<String>,
+    /// Accounts to assign to the group after creation.
+    pub pending_assign: Vec<u64>,
+}
+
 /// Persistent state for the sidebar widget.
 pub struct SidebarState {
     pub search_query: String,
-    /// Index of the last clicked account in the filtered list (for Shift-range).
+    /// Index of the last clicked account in the flat display list (for Shift-range).
     last_clicked_index: Option<usize>,
     pub sort_order: SortOrder,
+    /// Which groups are currently collapsed in the sidebar.
+    pub collapsed_groups: HashSet<String>,
+    /// Group editor popup state.
+    pub editing_group: Option<GroupEditorState>,
+    /// Pending sort change that needs user confirmation (warning about losing custom order).
+    pub pending_sort_change: Option<SortOrder>,
 }
 
 impl Default for SidebarState {
@@ -34,7 +95,10 @@ impl Default for SidebarState {
         Self {
             search_query: String::new(),
             last_clicked_index: None,
-            sort_order: SortOrder::Name,
+            sort_order: SortOrder::Custom,
+            collapsed_groups: HashSet::new(),
+            editing_group: None,
+            pending_sort_change: None,
         }
     }
 }
@@ -47,28 +111,70 @@ pub enum SidebarAction {
     ToggleSelect(u64),
     /// Range-select from the last click to this account (Shift+click).
     RangeSelect(Vec<u64>),
-    /// Copy the Job ID of the account's current game session.
+    /// Copy text to clipboard.
     CopyJobId(String),
     AddAccountDialog,
     /// Double-click: quick-launch this account.
     QuickLaunch(u64),
+    /// Assign accounts to a group (empty string = remove from group).
+    AssignGroup { user_ids: Vec<u64>, group: String },
+    /// Create a new group and optionally assign accounts to it.
+    CreateGroup {
+        name: String,
+        color: [u8; 3],
+        assign_user_ids: Vec<u64>,
+    },
+    /// Delete a group (its accounts become ungrouped).
+    DeleteGroup(String),
+    /// Edit a group's name and/or color.
+    EditGroup {
+        old_name: String,
+        new_name: String,
+        color: [u8; 3],
+    },
+    /// Reorder an account within its group/ungrouped list.
+    ReorderAccount {
+        user_id: u64,
+        target_user_id: u64,
+        /// If true, insert after the target instead of before.
+        insert_after: bool,
+    },
+    /// Reorder a group relative to another group.
+    ReorderGroup {
+        group_name: String,
+        target_group: String,
+        /// If true, insert after the target instead of before.
+        insert_after: bool,
+    },
+    /// User confirmed changing from custom sort → lose custom order.
+    ResetCustomOrder,
 }
 
-/// Sidebar result: an optional action and the list of currently visible user IDs.
+/// Sidebar result: actions to process and the list of currently visible user IDs.
 pub struct SidebarResult {
-    pub action: Option<SidebarAction>,
+    pub actions: Vec<SidebarAction>,
     pub visible_user_ids: Vec<u64>,
+    /// Screen rect of the "Add Account" button (for tutorial highlighting).
+    pub add_btn_rect: egui::Rect,
+    /// Screen rect of the accounts scroll area (for tutorial highlighting).
+    pub accounts_rect: egui::Rect,
 }
 
-/// Draw the sidebar. Returns action + visible account IDs.
+/// Draw the sidebar. Returns actions + visible account IDs.
 pub fn show(
     ui: &mut egui::Ui,
     state: &mut SidebarState,
     accounts: &[Account],
     selected_ids: &HashSet<u64>,
     anonymize: bool,
+    groups: &HashMap<String, GroupMeta>,
 ) -> SidebarResult {
-    let mut action: Option<SidebarAction> = None;
+    let mut actions: Vec<SidebarAction> = Vec::new();
+    let mut add_btn_rect = egui::Rect::NOTHING;
+    let mut accounts_rect = egui::Rect::NOTHING;
+
+    // Group editor floating window.
+    show_group_editor(ui, state, &mut actions);
 
     ui.vertical(|ui| {
         ui.heading("Accounts");
@@ -83,19 +189,42 @@ pub fn show(
         // Sort selector
         ui.horizontal(|ui| {
             ui.label("Sort:");
+            let prev_sort = state.sort_order;
             egui::ComboBox::from_id_salt("sort_order")
                 .selected_text(state.sort_order.to_string())
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut state.sort_order, SortOrder::Custom, "Custom");
                     ui.selectable_value(&mut state.sort_order, SortOrder::Name, "Name");
                     ui.selectable_value(&mut state.sort_order, SortOrder::Status, "Status");
                 });
+            // If switching away from Custom that has real positions, show warning
+            if prev_sort == SortOrder::Custom && state.sort_order != SortOrder::Custom {
+                let has_custom_positions = accounts.iter().any(|a| a.sort_order != u32::MAX)
+                    || groups.values().any(|g| g.sort_order != u32::MAX);
+                if has_custom_positions {
+                    // Revert and show confirmation dialog
+                    let desired = state.sort_order;
+                    state.sort_order = SortOrder::Custom;
+                    state.pending_sort_change = Some(desired);
+                }
+            }
+            // If switching TO Custom from another sort, auto-assign positions
+            if prev_sort != SortOrder::Custom && state.sort_order == SortOrder::Custom {
+                // Positions will be assigned by the handler (no custom positions yet)
+            }
         });
+
+        // Warning dialog for losing custom order
+        show_sort_warning(ui, state, &mut actions);
+
         ui.add_space(4.0);
 
         // Add account button
-        if ui.button("\u{2795}  Add Account").clicked() {
-            action = Some(SidebarAction::AddAccountDialog);
+        let add_btn_resp = ui.button("\u{2795}  Add Account");
+        if add_btn_resp.clicked() {
+            actions.push(SidebarAction::AddAccountDialog);
         }
+        add_btn_rect = add_btn_resp.rect;
 
         // Selection count badge
         if selected_ids.len() > 1 {
@@ -107,183 +236,330 @@ pub fn show(
 
         ui.separator();
 
-        // Build filtered list
+        // ---- Build filtered + sorted list ----
         let query = state.search_query.to_lowercase();
+        let is_searching = !query.is_empty();
         let mut filtered: Vec<(usize, &Account)> = accounts
             .iter()
             .enumerate()
-            .filter(|(_, account)| {
+            .filter(|(_, a)| {
                 if query.is_empty() {
                     return true;
                 }
-                account.username.to_lowercase().contains(&query)
-                    || account.display_name.to_lowercase().contains(&query)
-                    || account.alias.to_lowercase().contains(&query)
+                a.username.to_lowercase().contains(&query)
+                    || a.display_name.to_lowercase().contains(&query)
+                    || a.alias.to_lowercase().contains(&query)
             })
             .collect();
 
-        // Sort the filtered list
+        // Sort helper for the fallback (name-based) tiebreaker.
+        let name_cmp = |a: &Account, b: &Account| {
+            a.label().to_lowercase().cmp(&b.label().to_lowercase())
+        };
+
         match state.sort_order {
-            SortOrder::Name => {
+            SortOrder::Custom => {
+                // Primary: sort_order ascending, tiebreak: name
                 filtered.sort_by(|(_, a), (_, b)| {
-                    a.label().to_lowercase().cmp(&b.label().to_lowercase())
+                    a.sort_order.cmp(&b.sort_order).then_with(|| name_cmp(a, b))
                 });
             }
+            SortOrder::Name => {
+                filtered.sort_by(|(_, a), (_, b)| name_cmp(a, b));
+            }
             SortOrder::Status => {
-                // Higher presence type = more active; sort active first
                 filtered.sort_by(|(_, a), (_, b)| {
                     b.last_presence
                         .user_presence_type
                         .cmp(&a.last_presence.user_presence_type)
-                        .then_with(|| a.label().to_lowercase().cmp(&b.label().to_lowercase()))
+                        .then_with(|| name_cmp(a, b))
                 });
             }
         }
 
-        // Account list
+        // ---- Partition by group ----
+        let mut ungrouped: Vec<(usize, &Account)> = Vec::new();
+        let mut by_group: HashMap<&str, Vec<(usize, &Account)>> = HashMap::new();
+        for &item in &filtered {
+            if item.1.group.is_empty() {
+                ungrouped.push(item);
+            } else {
+                by_group.entry(item.1.group.as_str()).or_default().push(item);
+            }
+        }
+
+        // Sort group names: Custom mode uses GroupMeta.sort_order, otherwise alphabetical.
+        let mut group_names: Vec<&str> = by_group.keys().copied().collect();
+        match state.sort_order {
+            SortOrder::Custom => {
+                group_names.sort_by(|a, b| {
+                    let a_ord = groups.get(*a).map(|m| m.sort_order).unwrap_or(u32::MAX);
+                    let b_ord = groups.get(*b).map(|m| m.sort_order).unwrap_or(u32::MAX);
+                    a_ord.cmp(&b_ord).then_with(|| a.cmp(b))
+                });
+            }
+            _ => {
+                group_names.sort_unstable();
+            }
+        }
+
+        // Build flat display list for Shift+click range selection.
+        // Groups first, then ungrouped.
+        let mut flat_list: Vec<(usize, &Account)> = Vec::new();
+        for name in &group_names {
+            if is_searching || !state.collapsed_groups.contains(*name) {
+                flat_list.extend_from_slice(&by_group[name]);
+            }
+        }
+        flat_list.extend_from_slice(&ungrouped);
+
+        let is_custom = state.sort_order == SortOrder::Custom;
+
+        // ---- Render ----
+        accounts_rect = ui.available_rect_before_wrap();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (filter_idx, (_, account)) in filtered.iter().enumerate() {
-                    let is_selected = selected_ids.contains(&account.user_id);
-                    let has_subtitle = !anonymize
-                        && account.alias.is_empty()
-                        && account.display_name != account.username;
-                    let row_height = if has_subtitle { 36.0 } else { 24.0 };
+                let mut flat_idx: usize = 0;
 
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), row_height),
-                        egui::Sense::click(),
+                // Groups first (above ungrouped accounts)
+                for &group_name in &group_names {
+                    let meta = groups.get(group_name);
+                    let color = meta.map(|m| m.color).unwrap_or([130, 130, 130]);
+                    let members = &by_group[group_name];
+                    let is_collapsed = state.collapsed_groups.contains(group_name);
+                    let show_members = is_searching || !is_collapsed;
+                    let group_color = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                    let bg_color = egui::Color32::from_rgba_premultiplied(
+                        color[0] / 8,
+                        color[1] / 8,
+                        color[2] / 8,
+                        30,
                     );
 
-                    // Background highlight for selected / hovered
-                    if is_selected {
-                        ui.painter().rect_filled(
-                            rect,
-                            2.0,
-                            ui.style().visuals.selection.bg_fill,
-                        );
-                    } else if response.hovered() {
-                        ui.painter().rect_filled(
-                            rect,
-                            2.0,
-                            ui.style().visuals.widgets.hovered.bg_fill,
-                        );
-                    }
+                    // Outer frame for the whole group
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .stroke(egui::Stroke::new(1.0, group_color.gamma_multiply(0.4)))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::same(2.0))
+                        .outer_margin(egui::Margin { top: 2.0, bottom: 4.0, ..Default::default() })
+                        .show(ui, |ui: &mut egui::Ui| {
+                            // ---- Group header ----
+                            let header_height = 24.0;
+                            let sense = if is_custom {
+                                egui::Sense::click_and_drag()
+                            } else {
+                                egui::Sense::click()
+                            };
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), header_height),
+                                sense,
+                            );
 
-                    let painter = ui.painter_at(rect);
+                            // Drag source: group header (Custom mode only)
+                            if is_custom && response.drag_started() {
+                                response.dnd_set_drag_payload(DragPayload::Group {
+                                    name: group_name.to_string(),
+                                });
+                            }
 
-                    // Presence indicator dot
-                    let dot_color = if account.cookie_expired {
-                        egui::Color32::from_rgb(200, 60, 60) // Red for expired
-                    } else {
-                        presence_color(account.last_presence.user_presence_type)
-                    };
-                    painter.circle_filled(
-                        egui::pos2(rect.min.x + 8.0, rect.min.y + 12.0),
-                        4.0,
-                        dot_color,
-                    );
+                            // Header background on hover
+                            if response.hovered() || response.contains_pointer() {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    2.0,
+                                    group_color.gamma_multiply(0.15),
+                                );
+                            }
 
-                    // Expired cookie warning icon
-                    if account.cookie_expired {
-                        painter.text(
-                            egui::pos2(rect.min.x + 8.0, rect.min.y + 12.0),
-                            egui::Align2::CENTER_CENTER,
-                            "!",
-                            egui::FontId::proportional(7.0),
-                            egui::Color32::WHITE,
-                        );
-                    }
+                            // DnD: drop account on group header → assign to group
+                            let header_bottom_half = ui.ctx().pointer_latest_pos()
+                                .is_some_and(|pos| pos.y > rect.center().y);
 
-                    // Account label
-                    let display_label = if anonymize {
-                        format!("Account {}", filter_idx + 1)
-                    } else {
-                        account.label().to_string()
-                    };
-                    let label_pos = egui::pos2(rect.min.x + 20.0, rect.min.y + 3.0);
-                    painter.text(
-                        label_pos,
-                        egui::Align2::LEFT_TOP,
-                        &display_label,
-                        egui::FontId::proportional(14.0),
-                        ui.style().visuals.text_color(),
-                    );
+                            if let Some(payload) = response.dnd_hover_payload::<DragPayload>() {
+                                match payload.as_ref() {
+                                    DragPayload::Account { user_id, .. } => {
+                                        ui.painter().rect_stroke(
+                                            rect.expand(2.0),
+                                            4.0,
+                                            egui::Stroke::new(2.0, group_color),
+                                        );
+                                        let already_in = accounts
+                                            .iter()
+                                            .find(|a| a.user_id == *user_id)
+                                            .is_some_and(|a| a.group == group_name);
+                                        if !already_in {
+                                            let hint = format!("Add to {}", group_name);
+                                            ui.painter().text(
+                                                egui::pos2(rect.center().x, rect.max.y + 2.0),
+                                                egui::Align2::CENTER_TOP,
+                                                hint,
+                                                egui::FontId::proportional(10.0),
+                                                group_color,
+                                            );
+                                        }
+                                    }
+                                    DragPayload::Group { name } if is_custom && *name != group_name => {
+                                        // Reorder hint: show line at top or bottom
+                                        let line_y = if header_bottom_half { rect.max.y } else { rect.min.y };
+                                        ui.painter().hline(
+                                            rect.x_range(),
+                                            line_y,
+                                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 80)),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(payload) = response.dnd_release_payload::<DragPayload>() {
+                                match payload.as_ref() {
+                                    DragPayload::Account { user_id, .. } => {
+                                        actions.push(SidebarAction::AssignGroup {
+                                            user_ids: vec![*user_id],
+                                            group: group_name.to_string(),
+                                        });
+                                    }
+                                    DragPayload::Group { name } if is_custom && *name != group_name => {
+                                        actions.push(SidebarAction::ReorderGroup {
+                                            group_name: name.clone(),
+                                            target_group: group_name.to_string(),
+                                            insert_after: header_bottom_half,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
 
-                    // Display name subtitle (if different from label)
-                    if has_subtitle {
-                        let sub_pos = egui::pos2(rect.min.x + 20.0, rect.min.y + 19.0);
-                        painter.text(
-                            sub_pos,
-                            egui::Align2::LEFT_TOP,
-                            &account.display_name,
-                            egui::FontId::proportional(11.0),
-                            egui::Color32::GRAY,
-                        );
-                    }
+                            let painter = ui.painter_at(rect);
 
-                    if response.clicked() {
-                        let modifiers = ui.input(|i| i.modifiers);
-                        if modifiers.ctrl || modifiers.mac_cmd {
-                            // Ctrl+click: toggle this account
-                            action = Some(SidebarAction::ToggleSelect(account.user_id));
-                            state.last_clicked_index = Some(filter_idx);
-                        } else if modifiers.shift {
-                            // Shift+click: range select
-                            let anchor = state.last_clicked_index.unwrap_or(0);
-                            let lo = anchor.min(filter_idx);
-                            let hi = anchor.max(filter_idx);
-                            let range_ids: Vec<u64> = filtered[lo..=hi]
-                                .iter()
-                                .map(|(_, a)| a.user_id)
-                                .collect();
-                            action = Some(SidebarAction::RangeSelect(range_ids));
-                        } else {
-                            // Plain click: single select
-                            action = Some(SidebarAction::Select(account.user_id));
-                            state.last_clicked_index = Some(filter_idx);
-                        }
-                    }
+                            // Color accent bar on the left
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(rect.min, egui::vec2(3.0, header_height)),
+                                0.0,
+                                group_color,
+                            );
 
-                    // Double-click: quick launch
-                    if response.double_clicked() {
-                        action = Some(SidebarAction::QuickLaunch(account.user_id));
-                    }
+                            // Group name
+                            painter.text(
+                                egui::pos2(rect.min.x + 10.0, rect.min.y + 4.0),
+                                egui::Align2::LEFT_TOP,
+                                group_name,
+                                egui::FontId::proportional(13.0),
+                                group_color,
+                            );
 
-                    // Right-click context menu
-                    response.context_menu(|ui| {
-                        if let Some(ref gid) = account.last_presence.game_id {
-                            if account.last_presence.user_presence_type == 2 {
-                                if ui.button("\u{1f4cb}  Copy Job ID").clicked() {
-                                    action = Some(SidebarAction::CopyJobId(gid.clone()));
+                            // Member count
+                            painter.text(
+                                egui::pos2(rect.max.x - 6.0, rect.min.y + 5.0),
+                                egui::Align2::RIGHT_TOP,
+                                format!("{}", members.len()),
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::GRAY,
+                            );
+
+                            // Click header to toggle collapse
+                            if response.clicked() {
+                                if is_collapsed {
+                                    state.collapsed_groups.remove(group_name);
+                                } else {
+                                    state.collapsed_groups.insert(group_name.to_string());
+                                }
+                            }
+
+                            // Group header context menu
+                            response.context_menu(|ui: &mut egui::Ui| {
+                                if ui.button("\u{270f}  Edit Group").clicked() {
+                                    state.editing_group = Some(GroupEditorState {
+                                        name: group_name.to_string(),
+                                        color,
+                                        original_name: Some(group_name.to_string()),
+                                        pending_assign: Vec::new(),
+                                    });
                                     ui.close_menu();
                                 }
-                                if let Some(pid) = account.last_presence.place_id {
-                                    if ui.button("\u{1f4cb}  Copy Place ID").clicked() {
-                                        action = Some(SidebarAction::CopyJobId(pid.to_string()));
-                                        ui.close_menu();
-                                    }
+                                if ui.button("\u{1f5d1}  Delete Group").clicked() {
+                                    actions.push(SidebarAction::DeleteGroup(
+                                        group_name.to_string(),
+                                    ));
+                                    ui.close_menu();
                                 }
-                                ui.separator();
-                            }
-                        }
-                        if !anonymize {
-                            ui.label(format!("@{}", account.username));
-                            ui.label(format!("ID: {}", account.user_id));
-                        }
-                    });
+                            });
 
-                    // Tooltip with presence
-                    if !anonymize {
-                        response.on_hover_text(format!(
-                            "{} \u{2014} {}",
-                            account.username,
-                            account.last_presence.status_text()
-                        ));
-                    }
+                            // ---- Member rows ----
+                            if show_members {
+                                for &(_orig_idx, account) in members {
+                                    render_account_row(
+                                        ui,
+                                        account,
+                                        flat_idx,
+                                        selected_ids,
+                                        anonymize,
+                                        &flat_list,
+                                        state,
+                                        &mut actions,
+                                        groups,
+                                        is_custom,
+                                    );
+                                    flat_idx += 1;
+                                }
+                            }
+                        });
+                }
+
+                // Spacer between groups and ungrouped
+                if !group_names.is_empty() && !ungrouped.is_empty() {
+                    ui.add_space(6.0);
+                }
+
+                // Ungrouped accounts last
+                for &(_orig_idx, account) in &ungrouped {
+                    render_account_row(
+                        ui,
+                        account,
+                        flat_idx,
+                        selected_ids,
+                        anonymize,
+                        &flat_list,
+                        state,
+                        &mut actions,
+                        groups,
+                        is_custom,
+                    );
+                    flat_idx += 1;
                 }
             });
+
+        // ---- Floating drag label ----
+        // Show a small label following the pointer while dragging.
+        if let Some(payload) = egui::DragAndDrop::payload::<DragPayload>(ui.ctx()) {
+            if let Some(pos) = ui.ctx().pointer_latest_pos() {
+                let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("dnd_label"));
+                let painter = ui.ctx().layer_painter(layer);
+                let text = match payload.as_ref() {
+                    DragPayload::Account { label, user_id } => {
+                        if anonymize { format!("Account #{}", anon_tag(*user_id)) } else { label.clone() }
+                    }
+                    DragPayload::Group { name } => format!("\u{1f4c1} {}", name),
+                };
+                let galley = painter.layout_no_wrap(
+                    text,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+                let text_size = galley.size();
+                let label_rect = egui::Rect::from_min_size(
+                    egui::pos2(pos.x + 12.0, pos.y - 8.0),
+                    text_size + egui::vec2(10.0, 6.0),
+                );
+                painter.rect_filled(label_rect, 4.0, egui::Color32::from_rgb(60, 60, 60));
+                painter.galley(
+                    label_rect.min + egui::vec2(5.0, 3.0),
+                    galley,
+                    egui::Color32::WHITE,
+                );
+            }
+        }
     });
 
     let visible_user_ids = {
@@ -303,16 +579,423 @@ pub fn show(
     };
 
     SidebarResult {
-        action,
+        actions,
         visible_user_ids,
+        add_btn_rect,
+        accounts_rect,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Account row — supports drag-and-drop
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn render_account_row(
+    ui: &mut egui::Ui,
+    account: &Account,
+    flat_idx: usize,
+    selected_ids: &HashSet<u64>,
+    anonymize: bool,
+    flat_list: &[(usize, &Account)],
+    state: &mut SidebarState,
+    actions: &mut Vec<SidebarAction>,
+    _groups: &HashMap<String, GroupMeta>,
+    is_custom: bool,
+) {
+    let is_selected = selected_ids.contains(&account.user_id);
+    let has_subtitle =
+        !anonymize && account.alias.is_empty() && account.display_name != account.username;
+    let row_height = if has_subtitle { 36.0 } else { 24.0 };
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::click_and_drag(),
+    );
+
+    // ---- Drag source ----
+    let display_label = if anonymize {
+        format!("Account #{}", anon_tag(account.user_id))
+    } else {
+        account.label().to_string()
+    };
+    if response.drag_started() {
+        response.dnd_set_drag_payload(DragPayload::Account {
+            user_id: account.user_id,
+            label: display_label.clone(),
+        });
+    }
+
+    // ---- Drop target ----
+    let is_being_dragged_over = response.dnd_hover_payload::<DragPayload>().is_some();
+    let is_ungrouped = account.group.is_empty();
+
+    // Determine if cursor is in the bottom half of this row (for insert-after).
+    let pointer_in_bottom_half = ui.ctx().pointer_latest_pos()
+        .is_some_and(|pos| pos.y > rect.center().y);
+
+    if let Some(payload) = response.dnd_hover_payload::<DragPayload>() {
+        if let DragPayload::Account { user_id, .. } = payload.as_ref() {
+            if *user_id != account.user_id {
+                let drag_group = flat_list.iter()
+                    .find(|(_, a)| a.user_id == *user_id)
+                    .map(|(_, a)| a.group.as_str())
+                    .unwrap_or("");
+                let same_group = drag_group == account.group;
+
+                if is_custom && same_group {
+                    // Same group or both ungrouped in custom mode → show reorder hint
+                    ui.painter().rect_filled(rect, 2.0,
+                        egui::Color32::from_rgba_premultiplied(255, 200, 80, 40));
+                    // Draw an insertion line at the top or bottom of the row
+                    let line_y = if pointer_in_bottom_half { rect.max.y } else { rect.min.y };
+                    ui.painter().hline(
+                        rect.x_range(),
+                        line_y,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 80)),
+                    );
+                } else {
+                    // Different groups / assign-to-group drop
+                    let highlight_color = if is_ungrouped {
+                        egui::Color32::from_rgba_premultiplied(100, 200, 100, 50)
+                    } else {
+                        egui::Color32::from_rgba_premultiplied(100, 150, 255, 50)
+                    };
+                    ui.painter().rect_filled(rect, 2.0, highlight_color);
+                    ui.painter().rect_stroke(
+                        rect,
+                        2.0,
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(130, 200, 130)),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(payload) = response.dnd_release_payload::<DragPayload>() {
+        if let DragPayload::Account { user_id, .. } = payload.as_ref() {
+            if *user_id != account.user_id {
+                let drag_group = flat_list.iter()
+                    .find(|(_, a)| a.user_id == *user_id)
+                    .map(|(_, a)| a.group.as_str())
+                    .unwrap_or("");
+
+                if is_custom && drag_group == account.group {
+                    // Reorder within the same group/ungrouped
+                    actions.push(SidebarAction::ReorderAccount {
+                        user_id: *user_id,
+                        target_user_id: account.user_id,
+                        insert_after: pointer_in_bottom_half,
+                    });
+                } else if is_ungrouped {
+                    // Both ungrouped → prompt to create a group with both
+                    state.editing_group = Some(GroupEditorState {
+                        name: String::new(),
+                        color: GROUP_PRESETS[0].0,
+                        original_name: None,
+                        pending_assign: vec![*user_id, account.user_id],
+                    });
+                } else {
+                    // Drop onto a grouped account → add to that account's group
+                    actions.push(SidebarAction::AssignGroup {
+                        user_ids: vec![*user_id],
+                        group: account.group.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Background (don't overdraw if drag highlight is active)
+    if !is_being_dragged_over {
+        if is_selected {
+            ui.painter()
+                .rect_filled(rect, 2.0, ui.style().visuals.selection.bg_fill);
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 2.0, ui.style().visuals.widgets.hovered.bg_fill);
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+
+    // Presence indicator dot
+    let dot_color = if account.cookie_expired {
+        egui::Color32::from_rgb(200, 60, 60)
+    } else {
+        presence_color(account.last_presence.user_presence_type)
+    };
+    painter.circle_filled(
+        egui::pos2(rect.min.x + 8.0, rect.min.y + 12.0),
+        4.0,
+        dot_color,
+    );
+
+    if account.cookie_expired {
+        painter.text(
+            egui::pos2(rect.min.x + 8.0, rect.min.y + 12.0),
+            egui::Align2::CENTER_CENTER,
+            "!",
+            egui::FontId::proportional(7.0),
+            egui::Color32::WHITE,
+        );
+    }
+
+    // Account label
+    painter.text(
+        egui::pos2(rect.min.x + 20.0, rect.min.y + 3.0),
+        egui::Align2::LEFT_TOP,
+        &display_label,
+        egui::FontId::proportional(14.0),
+        ui.style().visuals.text_color(),
+    );
+
+    // Display name subtitle
+    if has_subtitle {
+        painter.text(
+            egui::pos2(rect.min.x + 20.0, rect.min.y + 19.0),
+            egui::Align2::LEFT_TOP,
+            &account.display_name,
+            egui::FontId::proportional(11.0),
+            egui::Color32::GRAY,
+        );
+    }
+
+    // Click handling (only if not dragging)
+    if response.clicked() {
+        let modifiers = ui.input(|i| i.modifiers);
+        if modifiers.ctrl || modifiers.mac_cmd {
+            actions.push(SidebarAction::ToggleSelect(account.user_id));
+            state.last_clicked_index = Some(flat_idx);
+        } else if modifiers.shift {
+            let anchor = state.last_clicked_index.unwrap_or(0);
+            let lo = anchor.min(flat_idx);
+            let hi = anchor.max(flat_idx);
+            let range_ids: Vec<u64> =
+                flat_list[lo..=hi].iter().map(|(_, a)| a.user_id).collect();
+            actions.push(SidebarAction::RangeSelect(range_ids));
+        } else {
+            actions.push(SidebarAction::Select(account.user_id));
+            state.last_clicked_index = Some(flat_idx);
+        }
+    }
+
+    if response.double_clicked() {
+        actions.push(SidebarAction::QuickLaunch(account.user_id));
+    }
+
+    // Right-click context menu
+    response.context_menu(|ui| {
+        // Game session info
+        if let Some(ref gid) = account.last_presence.game_id {
+            if account.last_presence.user_presence_type == 2 {
+                if ui.button("\u{1f4cb}  Copy Job ID").clicked() {
+                    actions.push(SidebarAction::CopyJobId(gid.clone()));
+                    ui.close_menu();
+                }
+                if let Some(pid) = account.last_presence.place_id {
+                    if ui.button("\u{1f4cb}  Copy Place ID").clicked() {
+                        actions.push(SidebarAction::CopyJobId(pid.to_string()));
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+            }
+        }
+
+        // Remove from group option
+        if !account.group.is_empty() {
+            if ui.button("\u{2934}  Remove from Group").clicked() {
+                actions.push(SidebarAction::AssignGroup {
+                    user_ids: vec![account.user_id],
+                    group: String::new(),
+                });
+                ui.close_menu();
+            }
+            ui.separator();
+        }
+
+        if anonymize {
+            ui.label(format!("Account #{}", anon_tag(account.user_id)));
+        } else {
+            ui.label(format!("@{}", account.username));
+            ui.label(format!("ID: {}", account.user_id));
+        }
+    });
+
+    // Tooltip (not during drag)
+    if !response.dragged() {
+        let tip = if anonymize {
+            format!("Account #{}", anon_tag(account.user_id))
+        } else {
+            format!(
+                "{} \u{2014} {}",
+                account.username,
+                account.last_presence.status_text()
+            )
+        };
+        response.on_hover_text(tip);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group editor popup
+// ---------------------------------------------------------------------------
+
+fn show_group_editor(
+    ui: &mut egui::Ui,
+    state: &mut SidebarState,
+    actions: &mut Vec<SidebarAction>,
+) {
+    if state.editing_group.is_none() {
+        return;
+    }
+
+    let is_edit = state
+        .editing_group
+        .as_ref()
+        .unwrap()
+        .original_name
+        .is_some();
+    let title = if is_edit { "Edit Group" } else { "New Group" };
+
+    let mut open = true;
+    let mut should_close = false;
+
+    {
+        let editor = state.editing_group.as_mut().unwrap();
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    let te = ui.text_edit_singleline(&mut editor.name);
+                    // Auto-focus the name field when creating a new group
+                    if !is_edit {
+                        te.request_focus();
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label("Color:");
+                ui.horizontal_wrapped(|ui| {
+                    for &(preset_color, label) in GROUP_PRESETS {
+                        let c = egui::Color32::from_rgb(
+                            preset_color[0],
+                            preset_color[1],
+                            preset_color[2],
+                        );
+                        let is_sel = editor.color == preset_color;
+                        let size = if is_sel { 22.0 } else { 18.0 };
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(size, size),
+                            egui::Sense::click(),
+                        );
+                        ui.painter().rect_filled(rect, 4.0, c);
+                        if is_sel {
+                            ui.painter().rect_stroke(
+                                rect,
+                                4.0,
+                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                            );
+                        }
+                        if resp.clicked() {
+                            editor.color = preset_color;
+                        }
+                        resp.on_hover_text(label);
+                    }
+                });
+
+                ui.add_space(8.0);
+                let name_valid = !editor.name.trim().is_empty();
+
+                // Enter key to confirm
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                ui.horizontal(|ui| {
+                    let save_clicked = ui
+                        .add_enabled(name_valid, egui::Button::new("Save"))
+                        .clicked();
+                    if save_clicked || (enter && name_valid) {
+                        let name = editor.name.trim().to_string();
+                        let color = editor.color;
+                        if let Some(ref old_name) = editor.original_name {
+                            actions.push(SidebarAction::EditGroup {
+                                old_name: old_name.clone(),
+                                new_name: name,
+                                color,
+                            });
+                        } else {
+                            actions.push(SidebarAction::CreateGroup {
+                                name,
+                                color,
+                                assign_user_ids: editor.pending_assign.clone(),
+                            });
+                        }
+                        should_close = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        should_close = true;
+                    }
+                });
+            });
+    }
+
+    if should_close || !open {
+        state.editing_group = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sort-change warning dialog
+// ---------------------------------------------------------------------------
+
+fn show_sort_warning(
+    ui: &mut egui::Ui,
+    state: &mut SidebarState,
+    actions: &mut Vec<SidebarAction>,
+) {
+    let Some(desired) = state.pending_sort_change else {
+        return;
+    };
+
+    let mut should_close = false;
+
+    egui::Window::new("Change Sort Order?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ui.ctx(), |ui| {
+            ui.label("Switching away from Custom sort will discard your manual ordering.");
+            ui.label("This cannot be undone.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Switch Anyway").clicked() {
+                    state.sort_order = desired;
+                    actions.push(SidebarAction::ResetCustomOrder);
+                    should_close = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    should_close = true;
+                }
+            });
+        });
+
+    if should_close {
+        state.pending_sort_change = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 fn presence_color(presence_type: u8) -> egui::Color32 {
     match presence_type {
-        1 => egui::Color32::from_rgb(60, 180, 75),   // Online — green
-        2 => egui::Color32::from_rgb(30, 144, 255),   // In Game — blue
-        3 => egui::Color32::from_rgb(255, 165, 0),    // In Studio — orange
-        _ => egui::Color32::from_rgb(130, 130, 130),  // Offline — gray
+        1 => egui::Color32::from_rgb(60, 180, 75),  // Online — green
+        2 => egui::Color32::from_rgb(30, 144, 255),  // In Game — blue
+        3 => egui::Color32::from_rgb(255, 165, 0),   // In Studio — orange
+        _ => egui::Color32::from_rgb(130, 130, 130), // Offline — gray
     }
 }

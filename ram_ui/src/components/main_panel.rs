@@ -24,7 +24,14 @@ pub struct MainPanelState {
     pub favorite_name_input: String,
 }
 
-/// Draw the main panel for a selected account. Returns an optional action.
+/// Result returned by the main panel.
+pub struct MainPanelResult {
+    pub action: Option<MainPanelAction>,
+    /// Screen rect of the Launch button (for tutorial highlighting).
+    pub launch_btn_rect: egui::Rect,
+}
+
+/// Draw the main panel for a selected account.
 pub fn show(
     ui: &mut egui::Ui,
     account: &Account,
@@ -33,8 +40,9 @@ pub fn show(
     avatar_bytes: Option<&Vec<u8>>,
     favorite_places: &[FavoritePlace],
     anonymize: bool,
-) -> Option<MainPanelAction> {
+) -> MainPanelResult {
     let mut action: Option<MainPanelAction> = None;
+    let mut launch_btn_rect = egui::Rect::NOTHING;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
     ui.vertical(|ui| {
@@ -162,6 +170,7 @@ pub fn show(
 
         ui.horizontal(|ui| {
             let launch_btn = ui.add_enabled(place_valid, egui::Button::new("🚀  Launch"));
+            launch_btn_rect = launch_btn.rect;
             if launch_btn.clicked() {
                 if let Ok(place_id) = state.place_id_input.parse::<u64>() {
                     let job_id = if state.job_id_input.trim().is_empty() {
@@ -261,7 +270,7 @@ pub fn show(
     });
     }); // ScrollArea
 
-    action
+    MainPanelResult { action, launch_btn_rect }
 }
 
 /// Show a placeholder when no account is selected.

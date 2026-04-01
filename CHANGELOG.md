@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.1
+
+### Notice
+- **Project moved to GitLab** — RM has moved from GitHub to GitLab. The new home is [gitlab.com/centerepic/robloxmanager](https://gitlab.com/centerepic/robloxmanager). Future releases and updates will be published there. The update checker has been switched to the new location.
+
 ## v1.3.0
 
 ### Added

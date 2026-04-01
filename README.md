@@ -1,8 +1,8 @@
 # RM - Roblox Manager
 
-> **🚚 This repository has moved.**
-> Development continues at **[gitlab.com/centerepic/robloxmanager](https://gitlab.com/centerepic/robloxmanager)**.
-> This GitHub repo is archived and will no longer receive updates.
+> **This repository has moved.**
+> Development continues at gitlab.com/centerepic/robloxmanager.
+> The GitHub repo is archived and will no longer receive updates.
 
 A fast, lightweight Roblox account manager built with Rust and [egui](https://github.com/emilk/egui). Manage multiple Roblox accounts, launch games, and switch between sessions with ease.
 

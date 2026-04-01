@@ -1,0 +1,43 @@
+stages:
+  - build
+  - release
+
+variables:
+  CARGO_TERM_COLOR: always
+
+build:
+  stage: build
+  tags:
+    - windows
+    - self-hosted
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  cache:
+    key: windows-release
+    paths:
+      - target/
+      - $env:USERPROFILE/.cargo/registry/
+      - $env:USERPROFILE/.cargo/git/
+  script:
+    - cargo build --release
+    - curl.exe --fail
+        --header "JOB-TOKEN: $env:CI_JOB_TOKEN"
+        --upload-file target\release\ram_ui.exe
+        "$env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/packages/generic/ram_ui/$env:CI_COMMIT_TAG/ram_ui.exe"
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  needs: [build]
+  script:
+    - echo "Creating release $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: "Release $CI_COMMIT_TAG"
+    description: "See [CHANGELOG.md]($CI_PROJECT_URL/-/blob/main/CHANGELOG.md) for details."
+    assets:
+      links:
+        - name: ram_ui.exe
+          url: "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/ram_ui/$CI_COMMIT_TAG/ram_ui.exe"

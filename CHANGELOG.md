@@ -23,7 +23,7 @@
 ## v1.2.0
 
 ### Added
-- **Automatic update check** — on startup, checks GitHub for a newer release and shows a clickable "Update available" link in the top bar.
+- **Automatic update check** — on startup, checks GitLab for a newer release and shows a clickable "Update available" link in the top bar.
 - **"What's New" changelog** — on the first launch after an update, a window displays the changelog for the new version.
 - **Standard data directory** — config and account data now stored in `%APPDATA%\RM` instead of next to the exe, so the app works from any location.
 - **Legacy data migration** — if existing data is found next to the exe, a native dialog offers to move it to the new location on startup.

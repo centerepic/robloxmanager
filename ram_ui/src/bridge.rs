@@ -105,7 +105,7 @@ pub enum BackendCommand {
     },
     /// Arrange all Roblox windows in a tiled grid.
     ArrangeWindows,
-    /// Check GitHub for a newer release.
+    /// Check GitLab for a newer release.
     CheckForUpdates { current_version: String },
     /// Resolve a place ID to its name (for private server auto-check).
     ResolvePlace {
@@ -168,7 +168,7 @@ pub enum BackendEvent {
     Error(String),
     /// Windows were arranged.
     WindowsArranged,
-    /// A newer version is available on GitHub.
+    /// A newer version is available on GitLab.
     UpdateAvailable { version: String, url: String },
     /// Place name resolved for a private server entry.
     PlaceResolved {

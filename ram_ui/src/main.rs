@@ -2,6 +2,7 @@
 
 mod app;
 mod bridge;
+mod browser_login;
 mod components;
 mod toast;
 
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 /// Canonical data directory: `%APPDATA%\RM`.
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     let base = std::env::var("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -65,20 +66,49 @@ fn maybe_migrate_legacy_data(data_dir: &std::path::Path) {
 }
 
 fn main() {
-    // Initialise tracing (logs to stderr, controllable via RUST_LOG).
-    tracing_subscriber::fmt()
+    let data_dir = data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+
+    // Log to a file so crashes are visible even without a console
+    // (the #[windows_subsystem = "windows"] attribute suppresses stderr).
+    let log_path = data_dir.join("rm.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+        );
 
-    let data_dir = data_dir();
+    if let Some(file) = log_file {
+        subscriber.with_writer(std::sync::Mutex::new(file)).init();
+    } else {
+        subscriber.init();
+    }
+
+    // Install a panic hook that flushes the message to the log before dying.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("PANIC: {info}");
+        prev_hook(info);
+    }));
+
+    // Browser-login child mode: re-entry point when the parent UI spawns us
+    // with the browser_login flag. Hosts the webview on this process's main
+    // thread and exits when the cookie is captured or the user cancels.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 4 && args[1] == browser_login::FLAG {
+        let profile_dir = PathBuf::from(&args[2]);
+        let outfile = PathBuf::from(&args[3]);
+        let code = browser_login::run_child(profile_dir, outfile);
+        std::process::exit(code);
+    }
 
     // Offer to migrate legacy data from the exe directory
     maybe_migrate_legacy_data(&data_dir);
-
-    // Ensure the data directory exists
-    let _ = std::fs::create_dir_all(&data_dir);
 
     // Resolve config and account paths.
     // If a legacy config.json still exists next to the exe (user declined migration),

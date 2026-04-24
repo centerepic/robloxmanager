@@ -25,9 +25,22 @@ enum Tab {
 // Add-account dialog state
 // ---------------------------------------------------------------------------
 
+/// Which page of the Add Account dialog the user is currently on.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum AddAccountStep {
+    /// Initial method picker: browser login vs. manual cookie paste.
+    #[default]
+    Choose,
+    /// Browser login subprocess is spawned / has completed.
+    Browser,
+    /// Manual `.ROBLOSECURITY` paste.
+    Manual,
+}
+
 #[derive(Default)]
 struct AddAccountDialog {
     open: bool,
+    step: AddAccountStep,
     cookie_input: String,
     /// Staging field for password — only committed on submit.
     password_input: String,
@@ -35,6 +48,10 @@ struct AddAccountDialog {
     loading: bool,
     /// Error message from the last failed attempt.
     last_error: Option<String>,
+    /// True while the embedded login window is open and we're waiting for a cookie.
+    browser_login_pending: bool,
+    /// Receiver for the outcome of the embedded login window, if one is active.
+    browser_login_rx: Option<std::sync::mpsc::Receiver<crate::browser_login::LoginOutcome>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -625,9 +642,12 @@ impl AppState {
                         }
                         sidebar::SidebarAction::AddAccountDialog => {
                             self.add_dialog.open = true;
+                            self.add_dialog.step = AddAccountStep::Choose;
                             self.add_dialog.cookie_input.clear();
                             self.add_dialog.last_error = None;
                             self.add_dialog.loading = false;
+                            self.add_dialog.browser_login_pending = false;
+                            self.add_dialog.browser_login_rx = None;
                             self.add_dialog.password_input = self.master_password.clone();
                             self.tutorial.advance_from(tutorial::TutorialStep::AddAccount);
                         }
@@ -1139,39 +1159,205 @@ impl AppState {
             return;
         }
 
+        // While the embedded login window is open we need the UI to keep
+        // ticking so the mpsc receiver below gets polled even without user
+        // input. Request a repaint a few times a second.
+        if self.add_dialog.browser_login_pending {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
+        // Poll the embedded-login receiver for a completed outcome.
+        if let Some(rx) = &self.add_dialog.browser_login_rx {
+            match rx.try_recv() {
+                Ok(crate::browser_login::LoginOutcome::Success(cookie)) => {
+                    self.add_dialog.cookie_input = cookie;
+                    self.add_dialog.browser_login_pending = false;
+                    self.add_dialog.browser_login_rx = None;
+                    self.add_dialog.last_error = None;
+                }
+                Ok(crate::browser_login::LoginOutcome::Cancelled) => {
+                    self.add_dialog.browser_login_pending = false;
+                    self.add_dialog.browser_login_rx = None;
+                }
+                Ok(crate::browser_login::LoginOutcome::Failed(e)) => {
+                    self.add_dialog.browser_login_pending = false;
+                    self.add_dialog.browser_login_rx = None;
+                    self.add_dialog.last_error =
+                        Some(format!("Browser login failed: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.add_dialog.browser_login_pending = false;
+                    self.add_dialog.browser_login_rx = None;
+                }
+            }
+        }
+
         let mut open = self.add_dialog.open;
         egui::Window::new("Add Account")
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(360.0)
             .show(ctx, |ui| {
-                ui.label("Paste or type the .ROBLOSECURITY cookie:");
-                ui.add_space(4.0);
+                match self.add_dialog.step {
+                    AddAccountStep::Choose => {
+                        ui.label("How would you like to add this account?");
+                        ui.add_space(10.0);
 
-                let cookie_edit = egui::TextEdit::multiline(&mut self.add_dialog.cookie_input)
-                    .desired_rows(3)
-                    .hint_text("_|WARNING:-DO-NOT-SHARE-THIS...");
-                let cookie_resp = ui.add_enabled(!self.add_dialog.loading, cookie_edit);
-                self.tutorial.cookie_field_rect = cookie_resp.rect;
-                ui.add_space(8.0);
+                        let full_w = ui.available_width();
+                        if ui
+                            .add_sized(
+                                [full_w, 48.0],
+                                egui::Button::new(
+                                    egui::RichText::new("🌐  Log in with browser")
+                                        .size(15.0),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let profile_dir = crate::data_dir().join("webview_profile");
+                            // Wipe the profile between attempts so stale sessions don't leak.
+                            let _ = std::fs::remove_dir_all(&profile_dir);
+                            crate::browser_login::spawn(profile_dir, tx);
+                            self.add_dialog.browser_login_rx = Some(rx);
+                            self.add_dialog.browser_login_pending = true;
+                            self.add_dialog.last_error = None;
+                            self.add_dialog.step = AddAccountStep::Browser;
+                        }
+                        ui.add_space(6.0);
+                        if ui
+                            .add_sized(
+                                [full_w, 48.0],
+                                egui::Button::new(
+                                    egui::RichText::new("📋  Paste cookie manually")
+                                        .size(15.0),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.add_dialog.step = AddAccountStep::Manual;
+                            self.add_dialog.last_error = None;
+                        }
+                    }
 
-                // Always show password field — uses a staging buffer so
-                // partial input is never committed.
-                ui.label(if self.master_password.is_empty() {
-                    "Set a master password for encryption:"
-                } else {
-                    "Master password:"
-                });
-                ui.add_enabled(
-                    !self.add_dialog.loading,
-                    egui::TextEdit::singleline(&mut self.add_dialog.password_input)
-                        .password(true)
-                        .hint_text("Master password"),
-                );
-                ui.add_space(4.0);
+                    AddAccountStep::Browser => {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.add_dialog.loading,
+                                    egui::Button::new("Back"),
+                                )
+                                .clicked()
+                            {
+                                self.add_dialog.step = AddAccountStep::Choose;
+                                self.add_dialog.cookie_input.clear();
+                                self.add_dialog.browser_login_rx = None;
+                                self.add_dialog.browser_login_pending = false;
+                                self.add_dialog.last_error = None;
+                            }
+                            ui.heading("Log in with browser");
+                        });
+                        ui.separator();
+                        ui.add_space(4.0);
 
-                // Show error from last attempt with retry option
+                        if self.add_dialog.browser_login_pending {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    "Log in in the opened window — this will fill in automatically when you're signed in.",
+                                );
+                            });
+                        } else if !self.add_dialog.cookie_input.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "✓ Cookie captured ({} chars)",
+                                    self.add_dialog.cookie_input.len()
+                                ))
+                                .color(egui::Color32::from_rgb(120, 200, 120)),
+                            );
+                        } else {
+                            ui.label("Login window was closed without signing in.");
+                            ui.add_space(4.0);
+                            if ui.button("🌐 Try again").clicked() {
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                let profile_dir = crate::data_dir().join("webview_profile");
+                                let _ = std::fs::remove_dir_all(&profile_dir);
+                                crate::browser_login::spawn(profile_dir, tx);
+                                self.add_dialog.browser_login_rx = Some(rx);
+                                self.add_dialog.browser_login_pending = true;
+                                self.add_dialog.last_error = None;
+                            }
+                        }
+                        ui.add_space(8.0);
+                    }
+
+                    AddAccountStep::Manual => {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.add_dialog.loading,
+                                    egui::Button::new("Back"),
+                                )
+                                .clicked()
+                            {
+                                self.add_dialog.step = AddAccountStep::Choose;
+                                self.add_dialog.cookie_input.clear();
+                                self.add_dialog.last_error = None;
+                            }
+                            ui.heading("Paste cookie");
+                        });
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        ui.label("Paste your .ROBLOSECURITY cookie:");
+                        ui.add_space(4.0);
+                        // Single-line password field — cookies are credential
+                        // material and can be ~2000 chars; this keeps the dialog
+                        // compact and the raw value off-screen.
+                        let cookie_edit =
+                            egui::TextEdit::singleline(&mut self.add_dialog.cookie_input)
+                                .password(true)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("_|WARNING:-DO-NOT-SHARE-THIS...");
+                        let cookie_resp =
+                            ui.add_enabled(!self.add_dialog.loading, cookie_edit);
+                        self.tutorial.cookie_field_rect = cookie_resp.rect;
+                        if !self.add_dialog.cookie_input.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "✓ cookie set ({} chars)",
+                                    self.add_dialog.cookie_input.len()
+                                ))
+                                .small()
+                                .color(egui::Color32::from_rgb(120, 200, 120)),
+                            );
+                        }
+                        ui.add_space(8.0);
+                    }
+                }
+
+                // Shared footer — master password (if needed), error, submit.
+                // Skipped on the Choose step since there's nothing to submit yet.
+                if self.add_dialog.step == AddAccountStep::Choose {
+                    return;
+                }
+
+                let needs_password = !self.config.use_credential_manager
+                    && self.master_password.is_empty();
+                if needs_password {
+                    ui.label("Set a master password for encryption:");
+                    ui.add_enabled(
+                        !self.add_dialog.loading,
+                        egui::TextEdit::singleline(&mut self.add_dialog.password_input)
+                            .password(true)
+                            .hint_text("Master password"),
+                    );
+                    ui.add_space(4.0);
+                }
+
                 if let Some(err) = &self.add_dialog.last_error {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -1190,21 +1376,20 @@ impl AppState {
                     });
                 } else {
                     let valid = !self.add_dialog.cookie_input.trim().is_empty()
-                        && !self.add_dialog.password_input.is_empty();
-
+                        && (!needs_password || !self.add_dialog.password_input.is_empty());
                     let button_label = if self.add_dialog.last_error.is_some() {
                         "Retry"
                     } else {
                         "Add"
                     };
-
                     if ui
                         .add_enabled(valid, egui::Button::new(button_label))
                         .clicked()
                     {
                         let cookie = self.add_dialog.cookie_input.trim().to_string();
-                        // Commit the password only on explicit submit
-                        self.master_password = self.add_dialog.password_input.clone();
+                        if needs_password {
+                            self.master_password = self.add_dialog.password_input.clone();
+                        }
                         self.add_dialog.loading = true;
                         self.add_dialog.last_error = None;
                         self.bridge.send(BackendCommand::AddAccount {

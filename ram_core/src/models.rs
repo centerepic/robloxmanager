@@ -32,6 +32,10 @@ pub struct Account {
     /// True if the last automatic revalidation found the cookie expired.
     #[serde(default)]
     pub cookie_expired: bool,
+    /// Latest moderation state for the account (None = not moderated as of the
+    /// last check, or never checked). Refreshed during periodic revalidation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<ModerationInfo>,
     /// Manual sort position (used in Custom sort mode). `u32::MAX` = not yet positioned.
     #[serde(default = "default_sort_order")]
     pub sort_order: u32,
@@ -50,6 +54,7 @@ impl Account {
             last_presence: Presence::default(),
             last_validated: None,
             cookie_expired: false,
+            moderation: None,
             sort_order: u32::MAX,
         }
     }
@@ -61,6 +66,37 @@ impl Account {
         } else {
             &self.alias
         }
+    }
+}
+
+/// Moderation / enforcement state on a Roblox account.
+///
+/// Populated by the periodic revalidation scan. `is_banned` reflects the
+/// public `isBanned` flag from `users.roblox.com/v1/users/{userId}` (permanent
+/// terminations). `reason` / `expires_at` are best-effort: scraped from the
+/// `/notapproved` page when the account is signed in, so they may be missing
+/// even when the account is moderated (Roblox UI changes, network errors,
+/// etc.). `last_checked` lets the UI age-gate the warning if the scan failed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModerationInfo {
+    /// True if the public profile reports the account as banned (terminated).
+    #[serde(default)]
+    pub is_banned: bool,
+    /// Human-readable reason from the moderation page, if we could scrape it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// When the moderation expires (None = permanent, or unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Timestamp of the last moderation check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked: Option<DateTime<Utc>>,
+}
+
+impl ModerationInfo {
+    /// True when the account is currently restricted in some way (perma or temp).
+    pub fn is_active(&self) -> bool {
+        self.is_banned || self.reason.is_some()
     }
 }
 
@@ -224,10 +260,25 @@ pub struct GroupMeta {
 }
 
 /// A saved favorite place for quick launching.
+///
+/// Superseded by [`LaunchPreset`] (stored as standalone JSON files under
+/// `presets/`). Kept on `AppConfig` only for backwards-compat migration on
+/// first launch after upgrade; new code should use `LaunchPreset`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FavoritePlace {
     pub name: String,
     pub place_id: u64,
+}
+
+/// A user-defined launch preset — name + Place ID + optional Job ID.
+/// Persisted as individual JSON files under `<data_dir>/presets/<slug>.json`
+/// so users can hand-edit, share, or back them up directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchPreset {
+    pub name: String,
+    pub place_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
 }
 
 /// A saved private server for quick launching.

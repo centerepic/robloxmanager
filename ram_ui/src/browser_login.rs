@@ -30,7 +30,20 @@ use wry::{WebContext, WebViewBuilder};
 /// Invoked as: `ram_ui.exe --browser-login <profile_dir> <outfile>`.
 pub const FLAG: &str = "--browser-login";
 
+/// CLI flag for the "Open browser as <account>" child mode.
+/// Invoked as: `ram_ui.exe --browse-as <profile_dir> <cookie_file>`.
+pub const BROWSE_AS_FLAG: &str = "--browse-as";
+
 const LOGIN_URL: &str = "https://www.roblox.com/login";
+/// First page the browse-as child navigates to. Picked so it's small and
+/// always loads — its only purpose is to give us a roblox.com origin from
+/// which to install the auth cookie via `document.cookie`. The init script
+/// then immediately redirects away before the login form renders.
+const BROWSE_AS_BOOT_URL: &str = "https://www.roblox.com/login";
+/// Path component of [`BROWSE_AS_BOOT_URL`] — used by the init script to
+/// detect the bootstrap navigation and skip the redirect on subsequent ones.
+const BROWSE_AS_BOOT_PATH: &str = "/login";
+const BROWSE_AS_HOME_URL: &str = "https://www.roblox.com/home";
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
 
 pub enum LoginOutcome {
@@ -162,6 +175,139 @@ fn try_extract_cookie(webview: &wry::WebView) -> Option<String> {
             Some(c.value().to_string())
         } else {
             None
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// "Open browser as" — fire-and-forget child window pre-loaded with an
+// account's cookie. Unlike the login flow there's no value to return: the
+// parent spawns it detached and the user closes the window when done.
+// ---------------------------------------------------------------------------
+
+/// Parent-side: spawn a detached child window logged in as the given cookie.
+/// The cookie is handed over via a one-shot file inside `profile_dir`; the
+/// child deletes that file as its first action so the secret never lives on
+/// disk longer than the spawn race. `label` is the username (or anon tag)
+/// shown in the window title.
+pub fn spawn_browse_as(profile_dir: PathBuf, cookie: String, label: String) -> Result<(), String> {
+    std::fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("create profile dir: {e}"))?;
+    let cookie_in = profile_dir.join("cookie.in");
+    // Clear any leftover from a previous failed spawn before writing fresh.
+    let _ = std::fs::remove_file(&cookie_in);
+    std::fs::write(&cookie_in, cookie.as_bytes())
+        .map_err(|e| format!("write cookie file: {e}"))?;
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    info!("browse_as parent: spawning child {}", exe.display());
+    std::process::Command::new(&exe)
+        .arg(BROWSE_AS_FLAG)
+        .arg(&profile_dir)
+        .arg(&cookie_in)
+        .arg(&label)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            // Best-effort cleanup if the spawn itself failed
+            let _ = std::fs::remove_file(&cookie_in);
+            format!("spawn child: {e}")
+        })?;
+    Ok(())
+}
+
+/// Entry point for the browse-as child. Returns an exit code for `std::process::exit`.
+pub fn run_browse_as_child(profile_dir: PathBuf, cookie_in: PathBuf, label: String) -> i32 {
+    match run_browse_as_inner(profile_dir, cookie_in, label) {
+        Ok(()) => 0,
+        Err(e) => {
+            warn!("browse_as child: {e}");
+            1
+        }
+    }
+}
+
+fn run_browse_as_inner(profile_dir: PathBuf, cookie_in: PathBuf, label: String) -> Result<(), String> {
+    info!("browse_as child: start, profile={}", profile_dir.display());
+
+    // Read and immediately delete the cookie hand-off file.
+    let cookie_value = std::fs::read_to_string(&cookie_in)
+        .map_err(|e| format!("read cookie file: {e}"))?;
+    let _ = std::fs::remove_file(&cookie_in);
+    let cookie_value = cookie_value.trim().to_string();
+    if cookie_value.is_empty() {
+        return Err("empty cookie hand-off".into());
+    }
+
+    std::fs::create_dir_all(&profile_dir)
+        .map_err(|e| format!("create profile dir: {e}"))?;
+
+    let event_loop = EventLoopBuilder::<()>::new().build();
+
+    let title = if label.is_empty() {
+        "Browsing as account".to_string()
+    } else {
+        format!("Browsing as {label}")
+    };
+    let window = WindowBuilder::new()
+        .with_title(&title)
+        .with_inner_size(tao::dpi::LogicalSize::new(1100.0, 800.0))
+        .build(&event_loop)
+        .map_err(|e| format!("window build: {e}"))?;
+
+    let mut web_context = WebContext::new(Some(profile_dir));
+
+    // WebView2's CookieManager.CreateCookie quietly stores any cookie whose
+    // Domain attribute matches the host as host-only — Domain=roblox.com never
+    // gets sent to www.roblox.com, and Domain=.roblox.com fares no better. So
+    // we install the cookie from inside roblox.com's own origin via
+    // document.cookie, which the underlying Chromium parser handles per
+    // RFC 6265 (treating any Domain as covering subdomains).
+    //
+    // To avoid flashing the login form, we register the cookie+redirect as an
+    // initialization script that runs BEFORE the page's own scripts. The first
+    // load lands on /login (boot URL), the init script installs the cookie and
+    // immediately `location.replace`s to /home, so the login UI never gets a
+    // chance to render. The init script runs on subsequent navigations too,
+    // but a path check prevents a redirect loop.
+    let cookie_js_literal = serde_json::to_string(&cookie_value)
+        .map_err(|e| format!("serialize cookie for JS: {e}"))?;
+    let boot_path_js = serde_json::to_string(BROWSE_AS_BOOT_PATH).unwrap();
+    let home_url_js = serde_json::to_string(BROWSE_AS_HOME_URL).unwrap();
+    let init_script = format!(
+        r#"(function(){{
+            try {{
+                document.cookie = ".ROBLOSECURITY=" + {cookie_js_literal} +
+                    "; path=/; domain=.roblox.com; secure; samesite=lax";
+            }} catch (e) {{}}
+            try {{
+                if (location.pathname.toLowerCase() === {boot_path_js}) {{
+                    location.replace({home_url_js});
+                }}
+            }} catch (e) {{}}
+        }})();"#,
+    );
+
+    let webview = WebViewBuilder::new_with_web_context(&mut web_context)
+        .with_url(BROWSE_AS_BOOT_URL)
+        .with_initialization_script(&init_script)
+        .build(&window)
+        .map_err(|e| format!("webview build: {e}"))?;
+
+    info!("browse_as child: entering event loop");
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        // `webview` is moved into this closure so it isn't dropped early —
+        // dropping it would tear down the window.
+        let _ = &webview;
+        if let Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } = event
+        {
+            *control_flow = ControlFlow::Exit;
         }
     })
 }

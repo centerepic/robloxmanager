@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::auth::RobloxClient;
 use crate::error::CoreError;
-use crate::models::Presence;
+use crate::models::{ModerationInfo, Presence};
 
 // ---------------------------------------------------------------------------
 // Avatar thumbnails
@@ -347,4 +347,193 @@ pub async fn check_for_updates(current_version: &str) -> Result<Option<(String, 
     } else {
         Ok(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Moderation / enforcement detection
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicUserResponse {
+    #[serde(default)]
+    is_banned: bool,
+}
+
+/// Check whether a Roblox user is **permanently terminated** via the public
+/// profile endpoint. Works without a cookie. Temporary moderations are NOT
+/// reflected here — use [`fetch_moderation_message`] alongside this for those.
+pub async fn fetch_public_ban_status(
+    client: &RobloxClient,
+    user_id: u64,
+) -> Result<bool, CoreError> {
+    let url = format!("https://users.roblox.com/v1/users/{user_id}");
+    let resp: PublicUserResponse = client.get_json(&url, "").await?;
+    Ok(resp.is_banned)
+}
+
+#[derive(Deserialize)]
+struct UsernameLookupResponse {
+    data: Vec<UsernameLookupEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsernameLookupEntry {
+    id: u64,
+    name: String,
+    display_name: String,
+}
+
+/// Look up a Roblox user by username. Returns `Ok(None)` if no such user
+/// exists. Crucially, this passes `excludeBannedUsers: false` so the lookup
+/// works for terminated accounts too — used by the "add anyway" flow when
+/// the cookie itself has been revoked.
+pub async fn lookup_username(
+    client: &RobloxClient,
+    username: &str,
+) -> Result<Option<(u64, String, String)>, CoreError> {
+    let body = serde_json::json!({
+        "usernames": [username],
+        "excludeBannedUsers": false,
+    });
+    let resp: UsernameLookupResponse = client
+        .post_json(
+            "https://users.roblox.com/v1/usernames/users",
+            "",
+            Some(&body),
+        )
+        .await?;
+    Ok(resp
+        .data
+        .into_iter()
+        .next()
+        .map(|e| (e.id, e.name, e.display_name)))
+}
+
+/// v1 payload from `usermoderation.roblox.com/v1/not-approved`. Carries the
+/// human-readable message and a punishment-type label. Fields we don't use
+/// are intentionally left off.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NotApprovedV1 {
+    #[serde(default)]
+    message_to_user: String,
+    #[serde(default)]
+    end_date: String,
+}
+
+/// v2 payload from `usermoderation.roblox.com/v2/not-approved`. Has the cleanest
+/// machine-readable timestamps, so we use it for expiry resolution.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct NotApprovedV2 {
+    restriction: Option<NotApprovedV2Restriction>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotApprovedV2Restriction {
+    #[serde(default)]
+    end_time: Option<String>,
+    #[serde(default)]
+    duration_seconds: Option<i64>,
+}
+
+/// Cookie-only moderation probe. Hits the two `usermoderation.roblox.com`
+/// endpoints (v1 for the localized message, v2 for the structured expiry).
+/// Returns `(reason, expires_at)` when the cookie is recognised AND the
+/// account is currently under an enforcement action, else `None`.
+///
+/// Doesn't need the user ID, so this works even when `validate_cookie` has
+/// failed (e.g. on a terminated account whose cookie has been revoked enough
+/// to break `users/authenticated` but not the moderation endpoints).
+pub async fn fetch_moderation_message(
+    client: &RobloxClient,
+    cookie: &str,
+) -> Option<(String, Option<chrono::DateTime<chrono::Utc>>)> {
+    let v1: Option<NotApprovedV1> = client
+        .get_json("https://usermoderation.roblox.com/v1/not-approved", cookie)
+        .await
+        .ok();
+    let v2: Option<NotApprovedV2> = client
+        .get_json("https://usermoderation.roblox.com/v2/not-approved", cookie)
+        .await
+        .ok();
+
+    let reason = v1.as_ref().and_then(|p| {
+        let m = p.message_to_user.trim();
+        if m.is_empty() {
+            None
+        } else {
+            Some(m.to_string())
+        }
+    })?;
+
+    let expires_at = v2
+        .as_ref()
+        .and_then(|p| p.restriction.as_ref())
+        .and_then(|r| {
+            r.end_time
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .or_else(|| {
+                    r.duration_seconds.and_then(|d| {
+                        if d > 0 {
+                            Some(chrono::Utc::now() + chrono::Duration::seconds(d))
+                        } else {
+                            None
+                        }
+                    })
+                })
+        })
+        .or_else(|| {
+            v1.as_ref().and_then(|p| {
+                let s = p.end_date.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|d| d.with_timezone(&chrono::Utc))
+                }
+            })
+        });
+    Some((reason, expires_at))
+}
+
+/// Fetch the current moderation snapshot for the signed-in account, combining
+/// the public `isBanned` check with the cookie-only moderation message.
+pub async fn fetch_moderation_status(
+    client: &RobloxClient,
+    user_id: u64,
+    cookie: &str,
+) -> Result<Option<ModerationInfo>, CoreError> {
+    let is_banned = fetch_public_ban_status(client, user_id)
+        .await
+        .unwrap_or(false);
+    let msg = fetch_moderation_message(client, cookie).await;
+
+    if !is_banned && msg.is_none() {
+        return Ok(None);
+    }
+
+    let (reason, expires_at) = match msg {
+        Some((r, e)) => (Some(r), e),
+        None => (None, None),
+    };
+
+    Ok(Some(ModerationInfo {
+        is_banned,
+        // No fabricated fallback: leave `reason` as `None` when we don't have
+        // a real one from the moderation endpoint. The UI can fall back to a
+        // generic title and, crucially, the caller's merge logic can preserve
+        // a previously-known specific reason instead of being clobbered by a
+        // generic string on subsequent revalidations.
+        reason,
+        expires_at,
+        last_checked: Some(chrono::Utc::now()),
+    }))
 }

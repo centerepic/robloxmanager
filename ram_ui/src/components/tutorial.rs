@@ -131,8 +131,8 @@ impl TutorialState {
             ),
             TutorialStep::EnterCookie => (
                 "Sign in to Roblox",
-                "Click the highlighted button and sign in with your Roblox account. \
-                 RM will pick up your account automatically once you're signed in.",
+                "Choose 'Log in with browser' and sign in in the popup window. \
+                 RM will pick up your account and continue the tutorial automatically.",
                 false,
                 false,
             ),
@@ -201,14 +201,17 @@ pub fn show_overlay(ctx: &egui::Context, state: &mut TutorialState) {
     let step_label = state.step_label();
     let is_done = state.step == TutorialStep::Done;
 
-    // Position: below the target rect if available, otherwise screen center
+    // Position: below the target rect if available; otherwise top-center so
+    // the callout doesn't pile on top of a centered modal (the Add Account
+    // dialog is anchored to screen center and would collide with a centered
+    // callout in Welcome/Done/no-target states).
     let screen = ctx.screen_rect();
     let anchor_pos = if has_target {
         let below = egui::pos2(target.center().x, target.max.y + 12.0);
         // Clamp horizontally so the callout doesn't go off screen
         egui::pos2(below.x.clamp(screen.min.x + 10.0, screen.max.x - 310.0), below.y)
     } else {
-        egui::pos2(screen.center().x - 150.0, screen.center().y - 80.0)
+        egui::pos2(screen.center().x - 150.0, screen.min.y + 60.0)
     };
 
     let mut close = false;

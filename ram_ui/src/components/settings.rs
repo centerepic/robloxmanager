@@ -92,7 +92,7 @@ pub fn show(
         if config.multi_instance_enabled && !config.kill_background_roblox {
             ui.colored_label(
                 egui::Color32::from_rgb(220, 160, 40),
-                "⚠ Recommended when multi-instance is enabled — tray processes stack up.",
+                "⚠ Recommended when multi-instance is enabled. Tray processes stack up.",
             );
         }
 

@@ -24,6 +24,17 @@ pub enum BackendCommand {
         password: String,
         use_credential_manager: bool,
     },
+    /// Add an account WITHOUT requiring `validate_cookie` to succeed. Looks
+    /// up the canonical user identity by username (works for terminated
+    /// accounts) and stores the cookie regardless of its current auth state.
+    /// Used by the "add anyway" path when a real cookie was rejected and the
+    /// user still wants the account tracked.
+    AddAccountForced {
+        cookie: String,
+        username: String,
+        password: String,
+        use_credential_manager: bool,
+    },
     /// Remove an account by user ID.
     RemoveAccount { user_id: u64 },
     /// Refresh avatar URLs for all accounts.
@@ -124,6 +135,16 @@ pub enum BackendCommand {
         password: String,
         use_credential_manager: bool,
     },
+    /// Decrypt the cookie and open a webview pre-logged-in as this account.
+    BrowseAsAccount {
+        user_id: u64,
+        encrypted_cookie: Option<String>,
+        password: String,
+        use_credential_manager: bool,
+        profile_dir: PathBuf,
+        /// Label for the webview window title (username or anon tag).
+        label: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +155,12 @@ pub enum BackendCommand {
 pub enum BackendEvent {
     /// An account was validated and is ready to be added.
     AccountValidated {
+        account: Box<Account>,
+        encrypted_cookie: Option<String>,
+    },
+    /// Sibling of [`AccountValidated`] for the "add anyway" path. Skips the
+    /// moderation-confirm dialog because the user already opted in.
+    AccountForceAdded {
         account: Box<Account>,
         encrypted_cookie: Option<String>,
     },
@@ -163,6 +190,8 @@ pub enum BackendEvent {
         valid: bool,
         username: String,
         display_name: String,
+        /// Latest moderation snapshot, or `None` if no enforcement is active.
+        moderation: Option<ram_core::models::ModerationInfo>,
     },
     /// An error occurred during a background operation.
     Error(String),
@@ -187,6 +216,17 @@ pub enum BackendEvent {
     },
     /// Share link resolution failed.
     ShareLinkFailed(String),
+    /// "Open browser as" child window was successfully spawned.
+    BrowseAsLaunched,
+    /// `validate_cookie` rejected the cookie during AddAccount. Carries the
+    /// raw cookie back so the UI can offer "open browser as" to investigate
+    /// (e.g. when the account is terminated and the cookie is revoked).
+    AddAccountAuthFailed {
+        cookie: String,
+        /// Best-effort moderation reason scraped despite the validation
+        /// failure (some revocations leave the moderation endpoints reachable).
+        moderation_message: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +323,27 @@ async fn handle_command(
             password,
             use_credential_manager,
         } => {
-            let (user_id, username, display_name) = client.validate_cookie(&cookie).await?;
+            let (user_id, username, display_name) = match client
+                .validate_cookie(&cookie)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    // Cookie rejected at the auth layer (401/403 → typically
+                    // terminated or otherwise revoked). Try the moderation
+                    // endpoint anyway — it sometimes still works and gives
+                    // us a real reason to show — then bounce back to the UI
+                    // so the user can open the cookie in a browser instead.
+                    info!("AddAccount: validate failed ({e}); probing moderation endpoint");
+                    let mod_msg = api::fetch_moderation_message(client, &cookie)
+                        .await
+                        .map(|(r, _)| r);
+                    return Ok(BackendEvent::AddAccountAuthFailed {
+                        cookie,
+                        moderation_message: mod_msg,
+                    });
+                }
+            };
             let mut account = Account::new(user_id, username, display_name);
 
             let encrypted = if use_credential_manager {
@@ -294,6 +354,13 @@ async fn handle_command(
             };
             account.encrypted_cookie = encrypted.clone();
             account.last_validated = Some(chrono::Utc::now());
+
+            // Detect any active moderation on this account so the UI can
+            // either warn the user (add flow) or flag it visually (revalidation).
+            match api::fetch_moderation_status(client, user_id, &cookie).await {
+                Ok(info) => account.moderation = info,
+                Err(e) => info!("Moderation check failed for {user_id} (non-fatal): {e}"),
+            }
 
             // Fetch avatar URL and image bytes immediately after validation
             if let Ok(avatars) = api::fetch_avatars(client, &cookie, &[user_id]).await {
@@ -308,6 +375,76 @@ async fn handle_command(
 
             info!("Validated account {} ({})", account.username, user_id);
             Ok(BackendEvent::AccountValidated {
+                account: Box::new(account),
+                encrypted_cookie: encrypted,
+            })
+        }
+        BackendCommand::AddAccountForced {
+            cookie,
+            username,
+            password,
+            use_credential_manager,
+        } => {
+            // Cookie didn't validate but the user wants to add the account
+            // anyway. Resolve the canonical identity by username so the entry
+            // we store points at a real Roblox account.
+            let (user_id, canonical_username, display_name) =
+                api::lookup_username(client, &username)
+                    .await?
+                    .ok_or_else(|| CoreError::AccountNotFound(username.clone()))?;
+
+            let mut account =
+                Account::new(user_id, canonical_username, display_name);
+
+            let encrypted = if use_credential_manager {
+                crypto::credential_store(user_id, &cookie)?;
+                None
+            } else {
+                Some(crypto::encrypt_cookie(&cookie, &password)?)
+            };
+            account.encrypted_cookie = encrypted.clone();
+            // Cookie failed validation upstream — record it as expired so the
+            // sidebar/main panel reflect reality. The next revalidation will
+            // unmark it if the user resolves things in the browser.
+            account.cookie_expired = true;
+
+            // Best-effort moderation: public ban flag + cookie-only message
+            // probe. Either may fail (cookie revoked, network, etc.) and we
+            // still want to add the account, so wrap in ok().
+            let is_banned = api::fetch_public_ban_status(client, user_id)
+                .await
+                .unwrap_or(false);
+            let msg = api::fetch_moderation_message(client, &cookie).await;
+            if is_banned || msg.is_some() {
+                let (reason, expires_at) = match msg {
+                    Some((r, e)) => (Some(r), e),
+                    None => (None, None),
+                };
+                account.moderation = Some(ram_core::models::ModerationInfo {
+                    is_banned,
+                    reason,
+                    expires_at,
+                    last_checked: Some(chrono::Utc::now()),
+                });
+            }
+
+            // Best-effort avatar fetch. thumbnails.roblox.com is public and
+            // works even if the cookie is dead, so this usually succeeds.
+            if let Ok(avatars) = api::fetch_avatars(client, &cookie, &[user_id]).await {
+                if let Some((_, url)) = avatars.first() {
+                    account.avatar_url = url.clone();
+                }
+                let images = api::download_avatar_images(client, &cookie, &avatars).await;
+                if !images.is_empty() {
+                    let _ = tx.send(BackendEvent::AvatarImagesReady(images));
+                }
+            }
+
+            info!(
+                "Force-added account {} ({}) with cookie_expired=true",
+                account.username, user_id
+            );
+            Ok(BackendEvent::AccountForceAdded {
                 account: Box::new(account),
                 encrypted_cookie: encrypted,
             })
@@ -576,20 +713,53 @@ async fn handle_command(
                 };
                 match client.validate_cookie(&cookie).await {
                     Ok((_, username, display_name)) => {
+                        // Cookie still works — also refresh moderation state.
+                        let moderation =
+                            api::fetch_moderation_status(client, *user_id, &cookie)
+                                .await
+                                .ok()
+                                .flatten();
                         let _ = tx.send(BackendEvent::AccountRevalidated {
                             user_id: *user_id,
                             valid: true,
                             username,
                             display_name,
+                            moderation,
                         });
                     }
                     Err(_) => {
                         info!("Cookie expired for user {user_id}");
+                        // Cookie's dead — try the moderation endpoint anyway
+                        // (it sometimes still works for accounts that were
+                        // *just* terminated and gives us the real reason
+                        // before further auth revocation kicks in), and fall
+                        // back to the public is-banned flag.
+                        let is_banned =
+                            api::fetch_public_ban_status(client, *user_id)
+                                .await
+                                .unwrap_or(false);
+                        let msg =
+                            api::fetch_moderation_message(client, &cookie).await;
+                        let (reason, expires_at) = match msg {
+                            Some((r, e)) => (Some(r), e),
+                            None => (None, None),
+                        };
+                        let moderation = if is_banned || reason.is_some() {
+                            Some(ram_core::models::ModerationInfo {
+                                is_banned,
+                                reason,
+                                expires_at,
+                                last_checked: Some(chrono::Utc::now()),
+                            })
+                        } else {
+                            None
+                        };
                         let _ = tx.send(BackendEvent::AccountRevalidated {
                             user_id: *user_id,
                             valid: false,
                             username: String::new(),
                             display_name: String::new(),
+                            moderation,
                         });
                     }
                 }
@@ -638,6 +808,26 @@ async fn handle_command(
                 // No universe_id — cannot resolve without auth. Return empty.
                 Ok(BackendEvent::PlaceResolved { index, place_name: String::new(), place_id, icon_bytes: None })
             }
+        }
+        BackendCommand::BrowseAsAccount {
+            user_id,
+            encrypted_cookie,
+            password,
+            use_credential_manager,
+            profile_dir,
+            label,
+        } => {
+            let cookie = if use_credential_manager {
+                crypto::credential_load(user_id)?
+            } else {
+                let enc = encrypted_cookie.ok_or_else(|| {
+                    CoreError::Crypto("no encrypted cookie stored for this account".into())
+                })?;
+                crypto::decrypt_cookie(&enc, &password)?
+            };
+            crate::browser_login::spawn_browse_as(profile_dir, cookie, label)
+                .map_err(CoreError::Process)?;
+            Ok(BackendEvent::BrowseAsLaunched)
         }
         BackendCommand::ResolveShareLink {
             share_code,

@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::bridge::{BackendBridge, BackendCommand, BackendEvent};
-use crate::components::{group_panel, main_panel, private_servers, settings, sidebar, tutorial};
+use crate::components::{
+    group_panel, main_panel, presets_panel, private_servers, settings, sidebar, tutorial,
+};
 use crate::toast::{Toast, Toasts};
 
 // ---------------------------------------------------------------------------
@@ -18,6 +20,7 @@ use crate::toast::{Toast, Toasts};
 enum Tab {
     Accounts,
     PrivateServers,
+    Presets,
     Settings,
 }
 
@@ -52,6 +55,25 @@ struct AddAccountDialog {
     browser_login_pending: bool,
     /// Receiver for the outcome of the embedded login window, if one is active.
     browser_login_rx: Option<std::sync::mpsc::Receiver<crate::browser_login::LoginOutcome>>,
+    /// Set when validation succeeded but the account is currently under
+    /// moderation. The store push is deferred until the user explicitly
+    /// chooses to add anyway (or cancels). Box keeps the dialog struct small.
+    pending_moderated: Option<Box<PendingModeratedAdd>>,
+    /// Raw cookie that the backend rejected at the auth layer. Held only
+    /// to power the "Open browser as" investigate button next to the error.
+    /// Cleared when the user retries, opens the browser, or closes the dialog.
+    rejected_cookie: Option<String>,
+    /// Whether the inline "add anyway" form (username field) is expanded.
+    force_add_form_open: bool,
+    /// Username buffer for the "add anyway" form.
+    force_add_username: String,
+}
+
+/// Snapshot of an about-to-be-added account that the user must confirm because
+/// Roblox reports it as moderated.
+struct PendingModeratedAdd {
+    account: ram_core::models::Account,
+    encrypted_cookie: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,10 +94,15 @@ pub struct AppState {
     selected_ids: HashSet<u64>,
     sidebar_state: sidebar::SidebarState,
     main_panel_state: main_panel::MainPanelState,
-    group_panel_state: group_panel::GroupPanelState,
     private_servers_state: private_servers::PrivateServerState,
+    presets_state: presets_panel::PresetsState,
     settings_state: settings::SettingsState,
     add_dialog: AddAccountDialog,
+
+    /// Cached preset list (loaded from disk on startup + after each edit).
+    presets: Vec<(PathBuf, ram_core::models::LaunchPreset)>,
+    /// Where preset files live on disk. Resolved once at startup.
+    presets_dir: PathBuf,
 
     /// Downloaded avatar image bytes, keyed by user ID.
     avatar_bytes: HashMap<u64, Vec<u8>>,
@@ -90,6 +117,10 @@ pub struct AppState {
     roblox_running: bool,
     /// Frame counter to throttle background refreshes.
     frame_count: u64,
+    /// Wall-clock timestamp of the last tray-kill sweep. Frame-counter timers
+    /// don't fire reliably in eframe's reactive mode (update() only runs on
+    /// input), so periodic background work uses real time instead.
+    last_tray_kill: Option<std::time::Instant>,
 
     /// Password prompt shown on first launch when store file exists.
     needs_unlock: bool,
@@ -148,15 +179,18 @@ impl AppState {
             selected_ids: HashSet::new(),
             sidebar_state,
             main_panel_state: main_panel::MainPanelState::default(),
-            group_panel_state: group_panel::GroupPanelState::default(),
             private_servers_state: private_servers::PrivateServerState::default(),
+            presets_state: presets_panel::PresetsState::default(),
             settings_state: settings::SettingsState::default(),
             add_dialog: AddAccountDialog::default(),
+            presets: Vec::new(),
+            presets_dir: ram_core::presets::presets_dir(&crate::data_dir()),
             avatar_bytes: HashMap::new(),
             game_icon_bytes: HashMap::new(),
             visible_user_ids: Vec::new(),
             roblox_running: false,
             frame_count: 0,
+            last_tray_kill: None,
             needs_unlock,
             unlock_password_input: String::new(),
             confirm_remove: None,
@@ -172,6 +206,9 @@ impl AppState {
 
         // Resolve game icons for saved private servers
         state.resolve_private_server_icons();
+
+        // Initial load of preset files from disk.
+        state.reload_presets();
 
         // Detect first launch after update
         let current = env!("CARGO_PKG_VERSION");
@@ -199,21 +236,43 @@ impl AppState {
             match event {
                 BackendEvent::AccountValidated {
                     account,
-                    encrypted_cookie: _,
+                    encrypted_cookie,
                 } => {
-                    let name = if self.config.anonymize_names {
-                        "Account".to_string()
+                    // If the account is moderated, don't add silently — let
+                    // the user confirm (or open a browser to investigate).
+                    let moderated =
+                        account.moderation.as_ref().is_some_and(|m| m.is_active());
+                    if moderated {
+                        self.add_dialog.loading = false;
+                        self.add_dialog.last_error = None;
+                        self.add_dialog.pending_moderated =
+                            Some(Box::new(PendingModeratedAdd {
+                                account: *account,
+                                encrypted_cookie,
+                            }));
+                        // Keep the dialog open so the warning step renders.
                     } else {
-                        account.username.clone()
-                    };
-                    // Avoid duplicates
-                    self.store.remove_by_id(account.user_id);
-                    self.store.accounts.push(*account);
-                    self.toasts.push(Toast::success(format!("Added {name}")));
-                    self.add_dialog.loading = false;
-                    self.add_dialog.last_error = None;
-                    self.tutorial.advance_from(tutorial::TutorialStep::EnterCookie);
-                    self.auto_save();
+                        let name = if self.config.anonymize_names {
+                            "Account".to_string()
+                        } else {
+                            account.username.clone()
+                        };
+                        // Avoid duplicates
+                        self.store.remove_by_id(account.user_id);
+                        self.store.accounts.push(*account);
+                        self.toasts.push(Toast::success(format!("Added {name}")));
+                        // Dismiss the dialog — the user's job is done.
+                        self.add_dialog.open = false;
+                        self.add_dialog.loading = false;
+                        self.add_dialog.last_error = None;
+                        self.add_dialog.cookie_input.clear();
+                        self.add_dialog.password_input.clear();
+                        self.add_dialog.browser_login_pending = false;
+                        self.add_dialog.browser_login_rx = None;
+                        self.add_dialog.rejected_cookie = None;
+                        self.tutorial.advance_from(tutorial::TutorialStep::EnterCookie);
+                        self.auto_save();
+                    }
                 }
                 BackendEvent::AccountRemoved { user_id } => {
                     self.store.remove_by_id(user_id);
@@ -253,11 +312,11 @@ impl AppState {
                 BackendEvent::BulkLaunchComplete { launched, failed } => {
                     if failed == 0 {
                         self.toasts.push(Toast::success(format!(
-                            "Bulk launch complete — {launched} launched"
+                            "Bulk launch complete: {launched} launched"
                         )));
                     } else {
                         self.toasts.push(Toast::error(format!(
-                            "Bulk launch done — {launched} launched, {failed} failed"
+                            "Bulk launch done: {launched} launched, {failed} failed"
                         )));
                     }
                     if self.config.auto_arrange_windows {
@@ -287,7 +346,10 @@ impl AppState {
                     valid,
                     username,
                     display_name,
+                    moderation,
                 } => {
+                    // Whether moderation flipped from None → Some this round.
+                    let mut newly_moderated = false;
                     if let Some(acc) = self.store.find_by_id_mut(user_id) {
                         if valid {
                             acc.last_validated = Some(chrono::Utc::now());
@@ -297,6 +359,41 @@ impl AppState {
                         } else {
                             acc.cookie_expired = true;
                         }
+                        let was_active =
+                            acc.moderation.as_ref().is_some_and(|m| m.is_active());
+                        let now_active =
+                            moderation.as_ref().is_some_and(|m| m.is_active());
+                        newly_moderated = !was_active && now_active;
+                        // Merge instead of clobber: when this scan didn't get
+                        // a specific reason / expiry (typically because the
+                        // cookie is dead and the auth'd moderation endpoint
+                        // can't be reached), preserve whatever we already
+                        // knew from a previous successful fetch.
+                        //
+                        // Generic stand-in strings from previous buggy fetches
+                        // ("Account terminated.", "Account moderated.") are
+                        // intentionally NOT preserved — better to fall back to
+                        // the banner's generic title than to keep displaying a
+                        // string that's no more informative than the title.
+                        fn is_specific(r: &str) -> bool {
+                            !matches!(
+                                r.trim(),
+                                "Account terminated." | "Account moderated."
+                            )
+                        }
+                        acc.moderation = match (acc.moderation.take(), moderation) {
+                            (Some(old), Some(mut new)) => {
+                                if new.reason.is_none() {
+                                    new.reason = old.reason.filter(|r| is_specific(r));
+                                }
+                                if new.expires_at.is_none() {
+                                    new.expires_at = old.expires_at;
+                                }
+                                Some(new)
+                            }
+                            (old, None) => old,
+                            (None, new) => new,
+                        };
                     }
                     self.auto_save();
                     if !valid {
@@ -307,7 +404,19 @@ impl AppState {
                                 acc.label().to_string()
                             };
                             self.toasts.push(Toast::error(format!(
-                                "Cookie expired for {label} — re-add with a fresh cookie"
+                                "Cookie expired for {label}. Re-add with a fresh cookie."
+                            )));
+                        }
+                    }
+                    if newly_moderated {
+                        if let Some(acc) = self.store.find_by_id(user_id) {
+                            let label = if self.config.anonymize_names {
+                                "An account".to_string()
+                            } else {
+                                acc.label().to_string()
+                            };
+                            self.toasts.push(Toast::error(format!(
+                                "{label} has been moderated. See the account panel for details."
                             )));
                         }
                     }
@@ -360,12 +469,60 @@ impl AppState {
                         universe_id,
                         index: idx,
                     });
-                    self.toasts.push(Toast::success("Share link resolved — private server added"));
+                    self.toasts.push(Toast::success("Share link resolved, private server added"));
                 }
                 BackendEvent::ShareLinkFailed(msg) => {
                     self.toasts.push(Toast::error(format!(
                         "Failed to resolve share link: {msg}"
                     )));
+                }
+                BackendEvent::BrowseAsLaunched => {
+                    self.toasts.push(Toast::success("Opening browser..."));
+                }
+                BackendEvent::AccountForceAdded {
+                    account,
+                    encrypted_cookie: _,
+                } => {
+                    let name = if self.config.anonymize_names {
+                        "Account".to_string()
+                    } else {
+                        account.username.clone()
+                    };
+                    self.store.remove_by_id(account.user_id);
+                    self.store.accounts.push(*account);
+                    self.toasts.push(Toast::success(format!("Added {name}")));
+                    // Reset the dialog fully — the user is done with this flow.
+                    self.add_dialog.open = false;
+                    self.add_dialog.loading = false;
+                    self.add_dialog.last_error = None;
+                    self.add_dialog.cookie_input.clear();
+                    self.add_dialog.password_input.clear();
+                    self.add_dialog.browser_login_pending = false;
+                    self.add_dialog.browser_login_rx = None;
+                    self.add_dialog.rejected_cookie = None;
+                    self.add_dialog.force_add_form_open = false;
+                    self.add_dialog.force_add_username.clear();
+                    self.tutorial.advance_from(tutorial::TutorialStep::EnterCookie);
+                    self.auto_save();
+                }
+                BackendEvent::AddAccountAuthFailed {
+                    cookie,
+                    moderation_message,
+                } => {
+                    // The validate step rejected the cookie. Most often this
+                    // means the account was terminated (cookie revoked) but
+                    // it could also be an expired or malformed cookie. Surface
+                    // a clearer message + stash the rejected cookie so the
+                    // dialog can offer "Open browser as" to investigate.
+                    self.add_dialog.loading = false;
+                    let msg = match moderation_message {
+                        Some(m) => format!(
+                            "Cookie was rejected by Roblox.\n\nLikely reason: {m}",
+                        ),
+                        None => "Cookie was rejected by Roblox. The account may be terminated, the cookie may be expired, or you may need to log in again.".to_string(),
+                    };
+                    self.add_dialog.last_error = Some(msg);
+                    self.add_dialog.rejected_cookie = Some(cookie);
                 }
             }
         }
@@ -434,6 +591,58 @@ impl AppState {
         }
     }
 
+    /// Reload the preset cache from disk. Called on startup and after every
+    /// save/delete so the UI stays in sync with what's actually on disk
+    /// (users can also hand-edit the JSON files outside the app).
+    fn reload_presets(&mut self) {
+        let data_dir = crate::data_dir();
+        match ram_core::presets::load_all(&data_dir) {
+            Ok((list, skipped)) => {
+                self.presets = list;
+                if !skipped.is_empty() {
+                    self.toasts.push(Toast::error(format!(
+                        "Skipped {} unreadable preset file(s)",
+                        skipped.len()
+                    )));
+                }
+            }
+            Err(e) => {
+                self.toasts
+                    .push(Toast::error(format!("Failed to load presets: {e}")));
+            }
+        }
+    }
+
+    /// Dispatch a "browse as" request: decrypt the cookie on the backend and
+    /// spawn a fresh webview window pre-logged-in as the account.
+    fn open_browser_as(&mut self, user_id: u64) {
+        let Some(account) = self.store.find_by_id(user_id) else {
+            return;
+        };
+        if !self.config.use_credential_manager && account.encrypted_cookie.is_none() {
+            self.toasts
+                .push(Toast::error("No stored cookie for this account"));
+            return;
+        }
+        let label = if self.config.anonymize_names {
+            format!("#{user_id}")
+        } else {
+            account.username.clone()
+        };
+        // Per-account profile dir so sessions don't bleed between accounts.
+        let profile_dir = crate::data_dir()
+            .join("webview_browse_as")
+            .join(user_id.to_string());
+        self.bridge.send(BackendCommand::BrowseAsAccount {
+            user_id,
+            encrypted_cookie: account.encrypted_cookie.clone(),
+            password: self.master_password.clone(),
+            use_credential_manager: self.config.use_credential_manager,
+            profile_dir,
+            label,
+        });
+    }
+
     /// Revalidate all account cookies in the background.
     fn trigger_revalidation(&self) {
         if self.store.accounts.is_empty() {
@@ -460,6 +669,11 @@ impl AppState {
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count += 1;
+        // Schedule a repaint so background timers below tick even when the
+        // user isn't interacting. Without this, eframe's reactive mode means
+        // update() sleeps indefinitely and periodic work (tray-kill,
+        // presence refresh, etc.) never fires.
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
         // Ensure the bridge can wake the UI when async events arrive.
         self.bridge.set_repaint_ctx(ctx.clone());
         self.process_events();
@@ -469,12 +683,19 @@ impl eframe::App for AppState {
             self.roblox_running = ram_core::process::is_roblox_running();
         }
 
-        // Periodically kill background tray Roblox processes when enabled
-        // (every ~600 frames ≈ 10s)
-        if (self.config.kill_background_roblox || self.config.multi_instance_enabled)
-            && self.frame_count.is_multiple_of(600)
-        {
-            ram_core::process::kill_tray_roblox();
+        // Periodically kill background tray Roblox processes when enabled.
+        // Uses wall-clock time so the cadence is reliable in reactive mode
+        // (the frame counter approach we used before only fired when the
+        // user happened to interact 600 times).
+        if self.config.kill_background_roblox || self.config.multi_instance_enabled {
+            let now = std::time::Instant::now();
+            let due = self
+                .last_tray_kill
+                .map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(10));
+            if due {
+                self.last_tray_kill = Some(now);
+                ram_core::process::kill_tray_roblox();
+            }
         }
 
         // Periodically refresh presence for visible accounts (every ~600 frames ≈ 10s)
@@ -531,6 +752,7 @@ impl eframe::App for AppState {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, Tab::Accounts, "📋 Accounts");
                 ui.selectable_value(&mut self.active_tab, Tab::PrivateServers, "🔒 Private Servers");
+                ui.selectable_value(&mut self.active_tab, Tab::Presets, "⭐ Presets");
                 ui.selectable_value(&mut self.active_tab, Tab::Settings, "⚙ Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some((ref version, ref url)) = self.update_available {
@@ -540,41 +762,43 @@ impl eframe::App for AppState {
                         }
                         ui.separator();
                     }
+                    if !self.store.accounts.is_empty()
+                        && ui
+                            .button("\u{1f504}")
+                            .on_hover_text(
+                                "Refresh all accounts: re-validate cookies, fetch moderation status, presence, and avatars",
+                            )
+                            .clicked()
+                    {
+                        self.toasts.push(Toast::info("Refreshing all accounts..."));
+                        self.trigger_revalidation();
+                        self.trigger_refresh();
+                    }
                     if self.roblox_running {
+                        let count = ram_core::process::roblox_instance_count();
                         ui.colored_label(
                             egui::Color32::from_rgb(30, 144, 255),
-                            "● Roblox Running",
+                            format!("● {count} Roblox instance{}", if count == 1 { "" } else { "s" }),
                         );
+                        ui.separator();
+                    }
+                    if self.selected_ids.len() > 1 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(130, 180, 255),
+                            format!("{} selected", self.selected_ids.len()),
+                        );
+                        ui.separator();
                     }
                     ui.label(format!("{} account(s)", self.store.accounts.len()));
                 });
             });
         });
 
-        // ---- Status bar ----
-        egui::TopBottomPanel::bottom("status_bar")
-            .exact_height(22.0)
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(format!("{} account(s)", self.store.accounts.len()));
-                    ui.separator();
-                    if self.roblox_running {
-                        let count = ram_core::process::roblox_instance_count();
-                        ui.colored_label(
-                            egui::Color32::from_rgb(30, 144, 255),
-                            format!("● {count} Roblox instance(s)"),
-                        );
-                    } else {
-                        ui.colored_label(egui::Color32::GRAY, "○ Roblox not running");
-                    }
-                    ui.separator();
-                    ui.label(format!("{} selected", self.selected_ids.len()));
-                });
-            });
 
         match self.active_tab {
             Tab::Accounts => self.show_accounts_tab(ctx),
             Tab::PrivateServers => self.show_private_servers_tab(ctx),
+            Tab::Presets => self.show_presets_tab(ctx),
             Tab::Settings => self.show_settings_tab(ctx),
         }
 
@@ -614,6 +838,7 @@ impl AppState {
                     &self.selected_ids,
                     self.config.anonymize_names,
                     &self.config.groups,
+                    &self.avatar_bytes,
                 );
                 self.visible_user_ids = result.visible_user_ids;
                 self.tutorial.add_btn_rect = result.add_btn_rect;
@@ -648,6 +873,8 @@ impl AppState {
                             self.add_dialog.loading = false;
                             self.add_dialog.browser_login_pending = false;
                             self.add_dialog.browser_login_rx = None;
+                            self.add_dialog.rejected_cookie = None;
+                            self.add_dialog.pending_moderated = None;
                             self.add_dialog.password_input = self.master_password.clone();
                             self.tutorial.advance_from(tutorial::TutorialStep::AddAccount);
                         }
@@ -655,14 +882,33 @@ impl AppState {
                             ui.output_mut(|o| o.copied_text = job_id.clone());
                             self.toasts.push(Toast::info("Copied to clipboard"));
                         }
+                        sidebar::SidebarAction::OpenBrowserAs(user_id) => {
+                            self.open_browser_as(user_id);
+                        }
                         sidebar::SidebarAction::QuickLaunch(user_id) => {
-                            // Use the first favorite place, or fall back to the main panel place_id_input
-                            let place_id = self
-                                .config
-                                .favorite_places
+                            // Prefer the first saved preset (with its Job ID
+                            // if any); otherwise fall back to whatever's in
+                            // the launch inputs right now.
+                            let (place_id, job_id) = self
+                                .presets
                                 .first()
-                                .map(|f| f.place_id)
-                                .or_else(|| self.main_panel_state.place_id_input.parse::<u64>().ok());
+                                .map(|(_, p)| (Some(p.place_id), p.job_id.clone()))
+                                .unwrap_or_else(|| {
+                                    let pid = self
+                                        .main_panel_state
+                                        .place_id_input
+                                        .parse::<u64>()
+                                        .ok();
+                                    let j = {
+                                        let t = self.main_panel_state.job_id_input.trim();
+                                        if t.is_empty() {
+                                            None
+                                        } else {
+                                            Some(t.to_string())
+                                        }
+                                    };
+                                    (pid, j)
+                                });
                             if let Some(place_id) = place_id {
                                 if let Some(acc) = self.store.find_by_id(user_id) {
                                     self.bridge.send(BackendCommand::LaunchGameEncrypted {
@@ -671,7 +917,7 @@ impl AppState {
                                         password: self.master_password.clone(),
                                         use_credential_manager: self.config.use_credential_manager,
                                         place_id,
-                                        job_id: None,
+                                        job_id,
                                         link_code: None,
                                         access_code: None,
                                         multi_instance: self.config.multi_instance_enabled,
@@ -681,7 +927,7 @@ impl AppState {
                                 }
                             } else {
                                 self.toasts.push(Toast::error(
-                                    "No favorite place or Place ID set — enter one first",
+                                    "No preset or Place ID set. Enter one first.",
                                 ));
                             }
                         }
@@ -830,10 +1076,14 @@ impl AppState {
                     .iter()
                     .filter(|a| self.selected_ids.contains(&a.user_id))
                     .collect();
+                let preset_view: Vec<ram_core::models::LaunchPreset> =
+                    self.presets.iter().map(|(_, p)| p.clone()).collect();
                 let action = group_panel::show(
                     ui,
                     &selected_accounts,
-                    &mut self.group_panel_state,
+                    &mut self.main_panel_state.place_id_input,
+                    &mut self.main_panel_state.job_id_input,
+                    &preset_view,
                     self.roblox_running,
                     self.config.anonymize_names,
                 );
@@ -873,13 +1123,15 @@ impl AppState {
                 let account = self.store.find_by_id(id).cloned();
                 if let Some(account) = account {
                     let avatar_bytes = self.avatar_bytes.get(&account.user_id);
+                    let preset_view: Vec<ram_core::models::LaunchPreset> =
+                        self.presets.iter().map(|(_, p)| p.clone()).collect();
                     let result = main_panel::show(
                         ui,
                         &account,
                         &mut self.main_panel_state,
                         self.roblox_running,
                         avatar_bytes,
-                        &self.config.favorite_places,
+                        &preset_view,
                         self.config.anonymize_names,
                     );
                     self.tutorial.launch_btn_rect = result.launch_btn_rect;
@@ -909,22 +1161,36 @@ impl AppState {
                                 }
                                 self.auto_save();
                             }
-                            main_panel::MainPanelAction::SaveFavorite { name, place_id } => {
-                                self.config.favorite_places.push(
-                                    ram_core::models::FavoritePlace { name, place_id },
-                                );
-                                let _ = self.config.save(&self.config_path);
-                                self.toasts.push(Toast::success("Favorite saved"));
-                            }
-                            main_panel::MainPanelAction::RemoveFavorite(index) => {
-                                if index < self.config.favorite_places.len() {
-                                    self.config.favorite_places.remove(index);
-                                    let _ = self.config.save(&self.config_path);
-                                    self.toasts.push(Toast::info("Favorite removed"));
+                            main_panel::MainPanelAction::SavePreset {
+                                name,
+                                place_id,
+                                job_id,
+                            } => {
+                                let preset = ram_core::models::LaunchPreset {
+                                    name,
+                                    place_id,
+                                    job_id,
+                                };
+                                match ram_core::presets::save(
+                                    &crate::data_dir(),
+                                    &preset,
+                                    None,
+                                ) {
+                                    Ok(_) => {
+                                        self.toasts.push(Toast::success("Preset saved"));
+                                        self.reload_presets();
+                                    }
+                                    Err(e) => {
+                                        self.toasts
+                                            .push(Toast::error(format!("Save failed: {e}")));
+                                    }
                                 }
                             }
                             main_panel::MainPanelAction::KillAll => {
                                 self.bridge.send(BackendCommand::KillAll);
+                            }
+                            main_panel::MainPanelAction::OpenBrowserAs(uid) => {
+                                self.open_browser_as(uid);
                             }
                         }
                     }
@@ -1068,6 +1334,57 @@ impl AppState {
         });
     }
 
+    fn show_presets_tab(&mut self, ctx: &egui::Context) {
+        let mut pending: Option<presets_panel::PresetsAction> = None;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            pending = presets_panel::show(ui, &mut self.presets_state, &self.presets);
+        });
+        // Handle the requested action outside the central-panel closure so we
+        // can mutate other parts of self without conflicting borrows.
+        let Some(action) = pending else { return };
+        match action {
+            presets_panel::PresetsAction::Save { path, preset } => {
+                let data_dir = crate::data_dir();
+                match ram_core::presets::save(&data_dir, &preset, path.as_deref()) {
+                    Ok(_) => {
+                        self.toasts.push(Toast::success("Preset saved"));
+                        self.reload_presets();
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::error(format!("Save failed: {e}")));
+                    }
+                }
+            }
+            presets_panel::PresetsAction::Delete(path) => {
+                match ram_core::presets::delete(&path) {
+                    Ok(()) => {
+                        self.toasts.push(Toast::info("Preset deleted"));
+                        // If the editor was pointing at this file, clear it.
+                        if self.presets_state.editing.as_deref() == Some(path.as_path()) {
+                            self.presets_state = presets_panel::PresetsState::default();
+                        }
+                        self.reload_presets();
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::error(format!("Delete failed: {e}")));
+                    }
+                }
+            }
+            presets_panel::PresetsAction::RevealFolder => {
+                if let Err(e) = std::fs::create_dir_all(&self.presets_dir) {
+                    self.toasts
+                        .push(Toast::error(format!("Could not create folder: {e}")));
+                    return;
+                }
+                let _ = std::process::Command::new("explorer")
+                    .arg(&self.presets_dir)
+                    .spawn();
+            }
+        }
+    }
+
     fn show_settings_tab(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let has_password = !self.master_password.is_empty();
@@ -1155,6 +1472,12 @@ impl AppState {
     }
 
     fn show_add_dialog(&mut self, ctx: &egui::Context) {
+        // Reset the per-step tutorial highlight every frame so stale rects
+        // from a previous dialog step don't continue to glow after the user
+        // has moved on (e.g., advanced from Choose → Browser, or closed the
+        // dialog entirely). The Choose-step renderer below re-populates it.
+        self.tutorial.browser_login_btn_rect = egui::Rect::NOTHING;
+
         if !self.add_dialog.open {
             return;
         }
@@ -1174,6 +1497,21 @@ impl AppState {
                     self.add_dialog.browser_login_pending = false;
                     self.add_dialog.browser_login_rx = None;
                     self.add_dialog.last_error = None;
+                    // If the user already has a master password set (or
+                    // credential-manager mode is on), there's nothing left
+                    // for them to confirm — send the cookie straight to the
+                    // backend instead of making them click "Add" redundantly.
+                    let needs_password = !self.config.use_credential_manager
+                        && self.master_password.is_empty();
+                    if !needs_password {
+                        let cookie = self.add_dialog.cookie_input.trim().to_string();
+                        self.add_dialog.loading = true;
+                        self.bridge.send(BackendCommand::AddAccount {
+                            cookie,
+                            password: self.master_password.clone(),
+                            use_credential_manager: self.config.use_credential_manager,
+                        });
+                    }
                 }
                 Ok(crate::browser_login::LoginOutcome::Cancelled) => {
                     self.add_dialog.browser_login_pending = false;
@@ -1193,7 +1531,218 @@ impl AppState {
             }
         }
 
+        // -----------------------------------------------------------------
+        // Moderation-warning short-circuit. When validation came back with an
+        // active moderation we render a confirm pane instead of the usual
+        // add flow. Buttons signal back via these flags so we can mutate
+        // self after the borrow on add_dialog ends.
+        // -----------------------------------------------------------------
         let mut open = self.add_dialog.open;
+        let mut mod_open_browser = false;
+        let mut mod_add_anyway = false;
+        let mut mod_cancel = false;
+        let mut mod_revalidate = false;
+
+        if self.add_dialog.pending_moderated.is_some() {
+            let pending = self.add_dialog.pending_moderated.as_deref().unwrap();
+            egui::Window::new("Account moderated")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(420.0)
+                .show(ctx, |ui| {
+                    let acc = &pending.account;
+                    let info = acc.moderation.as_ref().expect("moderation present");
+                    let banned = info.is_banned;
+                    let title_color = if banned {
+                        egui::Color32::from_rgb(255, 110, 110)
+                    } else {
+                        egui::Color32::from_rgb(240, 180, 80)
+                    };
+                    ui.colored_label(
+                        title_color,
+                        egui::RichText::new(if banned {
+                            "\u{26a0} This account is terminated."
+                        } else {
+                            "\u{26a0} This account is currently moderated."
+                        })
+                        .strong()
+                        .size(15.0),
+                    );
+                    ui.add_space(4.0);
+                    if !self.config.anonymize_names {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} (@{})",
+                                acc.display_name, acc.username
+                            ))
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    if let Some(reason) = &info.reason {
+                        ui.add_space(6.0);
+                        ui.label(reason);
+                    }
+                    match &info.expires_at {
+                        Some(exp) => {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Expires: {}",
+                                    exp.format("%Y-%m-%d %H:%M UTC")
+                                ))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        None if banned => {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Permanent termination.")
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        _ => {}
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("\u{1f310} Open browser as")
+                            .on_hover_text(
+                                "Sign in via webview to view the full moderation message or appeal",
+                            )
+                            .clicked()
+                        {
+                            mod_open_browser = true;
+                        }
+                        if ui
+                            .button("Re-validate")
+                            .on_hover_text(
+                                "Re-check moderation status. Use after resolving a warning or appeal in the browser.",
+                            )
+                            .clicked()
+                        {
+                            mod_revalidate = true;
+                        }
+                        if ui.button("Add anyway").clicked() {
+                            mod_add_anyway = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            mod_cancel = true;
+                        }
+                    });
+                });
+            self.add_dialog.open = open;
+
+            if mod_open_browser {
+                let user_id = self
+                    .add_dialog
+                    .pending_moderated
+                    .as_deref()
+                    .map(|p| p.account.user_id);
+                let enc = self
+                    .add_dialog
+                    .pending_moderated
+                    .as_deref()
+                    .and_then(|p| p.encrypted_cookie.clone());
+                if let Some(uid) = user_id {
+                    let label = if self.config.anonymize_names {
+                        format!("#{uid}")
+                    } else {
+                        self.add_dialog
+                            .pending_moderated
+                            .as_deref()
+                            .map(|p| p.account.username.clone())
+                            .unwrap_or_default()
+                    };
+                    let profile_dir = crate::data_dir()
+                        .join("webview_browse_as")
+                        .join(uid.to_string());
+                    self.bridge.send(BackendCommand::BrowseAsAccount {
+                        user_id: uid,
+                        encrypted_cookie: enc,
+                        password: self.master_password.clone(),
+                        use_credential_manager: self.config.use_credential_manager,
+                        profile_dir,
+                        label,
+                    });
+                }
+            }
+            if mod_revalidate {
+                // User likely just resolved a warning in the browser. Decrypt
+                // the cookie we kept on the pending entry and re-run the
+                // AddAccount cycle from scratch — same flow as if they'd
+                // pasted the cookie fresh, so a clean account now skips the
+                // moderation confirm.
+                if let Some(pending) = self.add_dialog.pending_moderated.take() {
+                    let raw_cookie = if self.config.use_credential_manager {
+                        ram_core::crypto::credential_load(pending.account.user_id).ok()
+                    } else {
+                        pending.encrypted_cookie.as_ref().and_then(|enc| {
+                            ram_core::crypto::decrypt_cookie(enc, &self.master_password).ok()
+                        })
+                    };
+                    match raw_cookie {
+                        Some(cookie) => {
+                            self.add_dialog.loading = true;
+                            self.add_dialog.last_error = None;
+                            self.bridge.send(BackendCommand::AddAccount {
+                                cookie,
+                                password: self.master_password.clone(),
+                                use_credential_manager: self.config.use_credential_manager,
+                            });
+                        }
+                        None => {
+                            // Couldn't recover the cookie — put the pending
+                            // entry back so the dialog stays usable, and tell
+                            // the user.
+                            self.add_dialog.pending_moderated = Some(pending);
+                            self.toasts.push(Toast::error(
+                                "Couldn't re-decrypt the cookie. Cancel and re-add manually.",
+                            ));
+                        }
+                    }
+                }
+            }
+            if mod_add_anyway {
+                if let Some(pending) = self.add_dialog.pending_moderated.take() {
+                    let name = if self.config.anonymize_names {
+                        "Account".to_string()
+                    } else {
+                        pending.account.username.clone()
+                    };
+                    self.store.remove_by_id(pending.account.user_id);
+                    self.store.accounts.push(pending.account);
+                    self.toasts.push(Toast::success(format!("Added {name}")));
+                    self.add_dialog.open = false;
+                    self.add_dialog.cookie_input.clear();
+                    self.add_dialog.password_input.clear();
+                    self.add_dialog.browser_login_pending = false;
+                    self.add_dialog.browser_login_rx = None;
+                    self.tutorial.advance_from(tutorial::TutorialStep::EnterCookie);
+                    self.auto_save();
+                }
+            }
+            if mod_cancel || !self.add_dialog.open {
+                // Clean up: if we stored a credential during validation, drop
+                // it so we don't leak an orphan secret in the OS keyring.
+                if self.config.use_credential_manager {
+                    if let Some(pending) = self.add_dialog.pending_moderated.as_deref() {
+                        let _ = ram_core::crypto::credential_delete(pending.account.user_id);
+                    }
+                }
+                self.add_dialog.pending_moderated = None;
+                self.add_dialog.open = false;
+                self.add_dialog.cookie_input.clear();
+                self.add_dialog.password_input.clear();
+                self.add_dialog.browser_login_pending = false;
+                self.add_dialog.browser_login_rx = None;
+            }
+            return;
+        }
+
         egui::Window::new("Add Account")
             .open(&mut open)
             .resizable(false)
@@ -1243,44 +1792,35 @@ impl AppState {
                     }
 
                     AddAccountStep::Browser => {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.add_dialog.loading,
-                                    egui::Button::new("Back"),
-                                )
-                                .clicked()
-                            {
-                                self.add_dialog.step = AddAccountStep::Choose;
-                                self.add_dialog.cookie_input.clear();
-                                self.add_dialog.browser_login_rx = None;
-                                self.add_dialog.browser_login_pending = false;
-                                self.add_dialog.last_error = None;
-                            }
-                            ui.heading("Log in with browser");
-                        });
-                        ui.separator();
-                        ui.add_space(4.0);
+                        if ui
+                            .add_enabled(
+                                !self.add_dialog.loading,
+                                egui::Button::new("\u{2190} Back").small(),
+                            )
+                            .clicked()
+                        {
+                            self.add_dialog.step = AddAccountStep::Choose;
+                            self.add_dialog.cookie_input.clear();
+                            self.add_dialog.browser_login_rx = None;
+                            self.add_dialog.browser_login_pending = false;
+                            self.add_dialog.last_error = None;
+                        }
+                        ui.add_space(8.0);
 
                         if self.add_dialog.browser_login_pending {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label(
-                                    "Log in in the opened window — this will fill in automatically when you're signed in.",
-                                );
+                                ui.label("Sign in to Roblox in the opened window.");
                             });
                         } else if !self.add_dialog.cookie_input.is_empty() {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "✓ Cookie captured ({} chars)",
-                                    self.add_dialog.cookie_input.len()
-                                ))
-                                .color(egui::Color32::from_rgb(120, 200, 120)),
+                                egui::RichText::new("Cookie captured.")
+                                    .color(egui::Color32::from_rgb(120, 200, 120)),
                             );
                         } else {
-                            ui.label("Login window was closed without signing in.");
-                            ui.add_space(4.0);
-                            if ui.button("🌐 Try again").clicked() {
+                            ui.label("Sign-in canceled.");
+                            ui.add_space(6.0);
+                            if ui.button("\u{1f310} Try again").clicked() {
                                 let (tx, rx) = std::sync::mpsc::channel();
                                 let profile_dir = crate::data_dir().join("webview_profile");
                                 let _ = std::fs::remove_dir_all(&profile_dir);
@@ -1294,25 +1834,19 @@ impl AppState {
                     }
 
                     AddAccountStep::Manual => {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.add_dialog.loading,
-                                    egui::Button::new("Back"),
-                                )
-                                .clicked()
-                            {
-                                self.add_dialog.step = AddAccountStep::Choose;
-                                self.add_dialog.cookie_input.clear();
-                                self.add_dialog.last_error = None;
-                            }
-                            ui.heading("Paste cookie");
-                        });
-                        ui.separator();
-                        ui.add_space(4.0);
+                        if ui
+                            .add_enabled(
+                                !self.add_dialog.loading,
+                                egui::Button::new("\u{2190} Back").small(),
+                            )
+                            .clicked()
+                        {
+                            self.add_dialog.step = AddAccountStep::Choose;
+                            self.add_dialog.cookie_input.clear();
+                            self.add_dialog.last_error = None;
+                        }
+                        ui.add_space(8.0);
 
-                        ui.label("Paste your .ROBLOSECURITY cookie:");
-                        ui.add_space(4.0);
                         // Single-line password field — cookies are credential
                         // material and can be ~2000 chars; this keeps the dialog
                         // compact and the raw value off-screen.
@@ -1320,18 +1854,8 @@ impl AppState {
                             egui::TextEdit::singleline(&mut self.add_dialog.cookie_input)
                                 .password(true)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("_|WARNING:-DO-NOT-SHARE-THIS...");
+                                .hint_text("Paste your .ROBLOSECURITY cookie");
                         ui.add_enabled(!self.add_dialog.loading, cookie_edit);
-                        if !self.add_dialog.cookie_input.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "✓ cookie set ({} chars)",
-                                    self.add_dialog.cookie_input.len()
-                                ))
-                                .small()
-                                .color(egui::Color32::from_rgb(120, 200, 120)),
-                            );
-                        }
                         ui.add_space(8.0);
                     }
                 }
@@ -1379,21 +1903,163 @@ impl AppState {
                     } else {
                         "Add"
                     };
-                    if ui
-                        .add_enabled(valid, egui::Button::new(button_label))
-                        .clicked()
-                    {
-                        let cookie = self.add_dialog.cookie_input.trim().to_string();
-                        if needs_password {
-                            self.master_password = self.add_dialog.password_input.clone();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(valid, egui::Button::new(button_label))
+                            .clicked()
+                        {
+                            let cookie = self.add_dialog.cookie_input.trim().to_string();
+                            if needs_password {
+                                self.master_password =
+                                    self.add_dialog.password_input.clone();
+                            }
+                            self.add_dialog.loading = true;
+                            self.add_dialog.last_error = None;
+                            self.add_dialog.rejected_cookie = None;
+                            self.bridge.send(BackendCommand::AddAccount {
+                                cookie,
+                                password: self.master_password.clone(),
+                                use_credential_manager: self.config.use_credential_manager,
+                            });
                         }
-                        self.add_dialog.loading = true;
-                        self.add_dialog.last_error = None;
-                        self.bridge.send(BackendCommand::AddAccount {
-                            cookie,
-                            password: self.master_password.clone(),
-                            use_credential_manager: self.config.use_credential_manager,
-                        });
+                        // When the backend rejected the cookie, give the user
+                        // a way to investigate (e.g. see the moderation page)
+                        // without leaving the app.
+                        if self.add_dialog.rejected_cookie.is_some()
+                            && ui
+                                .button("\u{1f310} Open browser as")
+                                .on_hover_text(
+                                    "Open a webview signed in with this cookie to see why it was rejected",
+                                )
+                                .clicked()
+                        {
+                            if let Some(cookie) =
+                                self.add_dialog.rejected_cookie.clone()
+                            {
+                                // Temp investigation profile, wiped each call so
+                                // we never carry state across separate cookies.
+                                let profile_dir =
+                                    crate::data_dir().join("webview_investigate");
+                                let _ = std::fs::remove_dir_all(&profile_dir);
+                                if let Err(e) =
+                                    crate::browser_login::spawn_browse_as(
+                                        profile_dir,
+                                        cookie,
+                                        "investigation".to_string(),
+                                    )
+                                {
+                                    self.toasts.push(Toast::error(format!(
+                                        "Browser launch failed: {e}"
+                                    )));
+                                } else {
+                                    self.toasts.push(Toast::info(
+                                        "Opening browser to investigate the cookie...",
+                                    ));
+                                }
+                            }
+                        }
+                        if self.add_dialog.rejected_cookie.is_some()
+                            && ui
+                                .button("Add anyway")
+                                .on_hover_text(
+                                    "Save the account even though validation failed (terminated alts, pending warnings, etc.)",
+                                )
+                                .clicked()
+                        {
+                            self.add_dialog.force_add_form_open =
+                                !self.add_dialog.force_add_form_open;
+                            if self.add_dialog.force_add_form_open {
+                                self.add_dialog.force_add_username.clear();
+                            }
+                        }
+                    });
+
+                    // Inline "add anyway" form — username lookup is required
+                    // because validate_cookie didn't run, so we have no
+                    // user_id / display_name from Roblox yet.
+                    if self.add_dialog.force_add_form_open
+                        && self.add_dialog.rejected_cookie.is_some()
+                    {
+                        ui.add_space(6.0);
+                        egui::Frame::default()
+                            .inner_margin(egui::Margin::same(8.0))
+                            .rounding(egui::Rounding::same(4.0))
+                            .fill(ui.visuals().faint_bg_color)
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            ))
+                            .show(ui, |ui: &mut egui::Ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new("Add anyway").strong(),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Enter the account's Roblox username so we can identify it. \
+                                         The cookie will be stored as-is and marked expired \
+                                         until you resolve the moderation in a browser.",
+                                    )
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                                );
+                                ui.add_space(6.0);
+                                let txt = ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.add_dialog.force_add_username,
+                                    )
+                                    .hint_text("Username")
+                                    .desired_width(f32::INFINITY),
+                                );
+                                let enter = txt.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    let name_ok = !self
+                                        .add_dialog
+                                        .force_add_username
+                                        .trim()
+                                        .is_empty();
+                                    let go = ui
+                                        .add_enabled(name_ok, egui::Button::new("Add"))
+                                        .clicked();
+                                    if (go || (enter && name_ok))
+                                        && self
+                                            .add_dialog
+                                            .rejected_cookie
+                                            .is_some()
+                                    {
+                                        let cookie = self
+                                            .add_dialog
+                                            .rejected_cookie
+                                            .clone()
+                                            .unwrap();
+                                        let username = self
+                                            .add_dialog
+                                            .force_add_username
+                                            .trim()
+                                            .to_string();
+                                        self.add_dialog.loading = true;
+                                        self.add_dialog.last_error = None;
+                                        self.bridge.send(
+                                            BackendCommand::AddAccountForced {
+                                                cookie,
+                                                username,
+                                                password: self
+                                                    .master_password
+                                                    .clone(),
+                                                use_credential_manager: self
+                                                    .config
+                                                    .use_credential_manager,
+                                            },
+                                        );
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.add_dialog.force_add_form_open = false;
+                                    }
+                                });
+                            });
                     }
                 }
             });

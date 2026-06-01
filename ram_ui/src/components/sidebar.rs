@@ -116,6 +116,8 @@ pub enum SidebarAction {
     AddAccountDialog,
     /// Double-click: quick-launch this account.
     QuickLaunch(u64),
+    /// Open a webview pre-logged in as this account.
+    OpenBrowserAs(u64),
     /// Assign accounts to a group (empty string = remove from group).
     AssignGroup { user_ids: Vec<u64>, group: String },
     /// Create a new group and optionally assign accounts to it.
@@ -168,6 +170,7 @@ pub fn show(
     selected_ids: &HashSet<u64>,
     anonymize: bool,
     groups: &HashMap<String, GroupMeta>,
+    avatar_bytes: &HashMap<u64, Vec<u8>>,
 ) -> SidebarResult {
     let mut actions: Vec<SidebarAction> = Vec::new();
     let mut add_btn_rect = egui::Rect::NOTHING;
@@ -500,6 +503,7 @@ pub fn show(
                                         &mut actions,
                                         groups,
                                         is_custom,
+                                        avatar_bytes,
                                     );
                                     flat_idx += 1;
                                 }
@@ -525,6 +529,7 @@ pub fn show(
                         &mut actions,
                         groups,
                         is_custom,
+                        avatar_bytes,
                     );
                     flat_idx += 1;
                 }
@@ -602,11 +607,13 @@ fn render_account_row(
     actions: &mut Vec<SidebarAction>,
     _groups: &HashMap<String, GroupMeta>,
     is_custom: bool,
+    avatar_bytes: &HashMap<u64, Vec<u8>>,
 ) {
     let is_selected = selected_ids.contains(&account.user_id);
     let has_subtitle =
         !anonymize && account.alias.is_empty() && account.display_name != account.username;
-    let row_height = if has_subtitle { 36.0 } else { 24.0 };
+    let row_height = 40.0;
+    let avatar_size = 32.0;
 
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
@@ -716,47 +723,90 @@ fn render_account_row(
         }
     }
 
-    let painter = ui.painter_at(rect);
-
-    // Presence indicator dot
-    let dot_color = if account.cookie_expired {
-        egui::Color32::from_rgb(200, 60, 60)
-    } else {
-        presence_color(account.last_presence.user_presence_type)
-    };
-    painter.circle_filled(
-        egui::pos2(rect.min.x + 8.0, rect.min.y + 12.0),
-        4.0,
-        dot_color,
+    // ---- Avatar thumbnail (or gray placeholder) ----
+    let avatar_pad = (row_height - avatar_size) / 2.0;
+    let avatar_rect = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + 6.0, rect.min.y + avatar_pad),
+        egui::vec2(avatar_size, avatar_size),
     );
-
-    if account.cookie_expired {
-        painter.text(
-            egui::pos2(rect.min.x + 8.0, rect.min.y + 12.0),
+    if let Some(bytes) = avatar_bytes.get(&account.user_id).filter(|_| !anonymize) {
+        let uri = format!("bytes://sidebar_avatar/{}.png", account.user_id);
+        egui::Image::from_bytes(uri, bytes.clone())
+            .rounding(egui::Rounding::same(avatar_size / 2.0))
+            .paint_at(ui, avatar_rect);
+    } else {
+        ui.painter().rect_filled(
+            avatar_rect,
+            avatar_size / 2.0,
+            egui::Color32::from_rgb(60, 60, 70),
+        );
+        ui.painter().text(
+            avatar_rect.center(),
             egui::Align2::CENTER_CENTER,
-            "!",
-            egui::FontId::proportional(7.0),
+            if anonymize { "?" } else { "…" },
+            egui::FontId::proportional(avatar_size * 0.45),
+            egui::Color32::from_rgb(160, 160, 170),
+        );
+    }
+
+    // ---- Status dot overlaid on bottom-right of the avatar ----
+    // Three mutually-exclusive states take precedence over plain presence:
+    //   1. moderated → orange dot with "!" (the strongest "needs attention" cue)
+    //   2. cookie_expired → red dot with "x"
+    //   3. otherwise → green/blue/orange/gray presence dot
+    let moderated = account.moderation.as_ref().is_some_and(|m| m.is_active());
+    let (dot_color, dot_glyph) = if moderated {
+        (egui::Color32::from_rgb(230, 130, 40), Some("!"))
+    } else if account.cookie_expired {
+        (egui::Color32::from_rgb(200, 60, 60), Some("x"))
+    } else {
+        (presence_color(account.last_presence.user_presence_type), None)
+    };
+    let dot_center =
+        egui::pos2(avatar_rect.max.x - 5.0, avatar_rect.max.y - 5.0);
+    // Background "halo" so the dot reads against any avatar color
+    ui.painter().circle_filled(
+        dot_center,
+        6.0,
+        ui.visuals().panel_fill,
+    );
+    ui.painter().circle_filled(dot_center, 4.5, dot_color);
+    if let Some(glyph) = dot_glyph {
+        ui.painter().text(
+            dot_center,
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::proportional(8.0),
             egui::Color32::WHITE,
         );
     }
 
-    // Account label
-    painter.text(
-        egui::pos2(rect.min.x + 20.0, rect.min.y + 3.0),
-        egui::Align2::LEFT_TOP,
-        &display_label,
-        egui::FontId::proportional(14.0),
-        ui.style().visuals.text_color(),
-    );
-
-    // Display name subtitle
+    // ---- Label + optional subtitle ----
+    let text_x = avatar_rect.max.x + 8.0;
+    let painter = ui.painter_at(rect);
     if has_subtitle {
         painter.text(
-            egui::pos2(rect.min.x + 20.0, rect.min.y + 19.0),
+            egui::pos2(text_x, rect.min.y + 5.0),
+            egui::Align2::LEFT_TOP,
+            &display_label,
+            egui::FontId::proportional(13.5),
+            ui.style().visuals.text_color(),
+        );
+        painter.text(
+            egui::pos2(text_x, rect.min.y + 22.0),
             egui::Align2::LEFT_TOP,
             &account.display_name,
             egui::FontId::proportional(11.0),
-            egui::Color32::GRAY,
+            ui.visuals().weak_text_color(),
+        );
+    } else {
+        // Single line — vertically center it within the row.
+        painter.text(
+            egui::pos2(text_x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &display_label,
+            egui::FontId::proportional(13.5),
+            ui.style().visuals.text_color(),
         );
     }
 
@@ -785,6 +835,12 @@ fn render_account_row(
 
     // Right-click context menu
     response.context_menu(|ui| {
+        if ui.button("\u{1f310}  Open browser as").clicked() {
+            actions.push(SidebarAction::OpenBrowserAs(account.user_id));
+            ui.close_menu();
+        }
+        ui.separator();
+
         // Game session info
         if let Some(ref gid) = account.last_presence.game_id {
             if account.last_presence.user_presence_type == 2 {
@@ -828,7 +884,7 @@ fn render_account_row(
             format!("Account #{}", anon_tag(account.user_id))
         } else {
             format!(
-                "{} \u{2014} {}",
+                "{}: {}",
                 account.username,
                 account.last_presence.status_text()
             )

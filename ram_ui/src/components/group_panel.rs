@@ -2,7 +2,7 @@
 //! Provides bulk launch, bulk remove, and selection summary.
 
 use eframe::egui;
-use ram_core::models::Account;
+use ram_core::models::{Account, LaunchPreset};
 
 /// Actions the group panel can request.
 pub enum GroupPanelAction {
@@ -17,18 +17,16 @@ pub enum GroupPanelAction {
     KillAll,
 }
 
-/// Persistent input state for the group panel.
-#[derive(Default)]
-pub struct GroupPanelState {
-    pub place_id_input: String,
-    pub job_id_input: String,
-}
-
 /// Draw the group control panel for multiple selected accounts.
+/// `place_id_input` and `job_id_input` are owned by the parent so single-launch
+/// and bulk-launch views share the same fields — typing a Place ID into one
+/// makes it appear in the other immediately.
 pub fn show(
     ui: &mut egui::Ui,
     selected_accounts: &[&Account],
-    state: &mut GroupPanelState,
+    place_id_input: &mut String,
+    job_id_input: &mut String,
+    presets: &[LaunchPreset],
     roblox_running: bool,
     anonymize: bool,
 ) -> Option<GroupPanelAction> {
@@ -80,33 +78,54 @@ pub fn show(
         ui.label("All selected accounts will join the same server sequentially.");
         ui.add_space(4.0);
 
+        // Preset quick-select chips (same set as the single-launch view).
+        if !presets.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Presets:");
+                for preset in presets {
+                    let btn = ui.small_button(&preset.name)
+                        .on_hover_text(match &preset.job_id {
+                            Some(j) if !j.is_empty() => {
+                                format!("Place {}, Job {}", preset.place_id, j)
+                            }
+                            _ => format!("Place {}", preset.place_id),
+                        });
+                    if btn.clicked() {
+                        *place_id_input = preset.place_id.to_string();
+                        *job_id_input = preset.job_id.clone().unwrap_or_default();
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+
         egui::Grid::new("bulk_launch_grid")
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label("Place ID:");
-                ui.text_edit_singleline(&mut state.place_id_input);
+                ui.text_edit_singleline(place_id_input);
                 ui.end_row();
 
                 ui.label("Job ID (optional):");
-                ui.text_edit_singleline(&mut state.job_id_input);
+                ui.text_edit_singleline(job_id_input);
                 ui.end_row();
             });
 
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            let place_valid = state.place_id_input.parse::<u64>().is_ok();
+            let place_valid = place_id_input.parse::<u64>().is_ok();
             let btn = ui.add_enabled(
                 place_valid,
                 egui::Button::new(format!("\u{1f680}  Launch {count} Accounts")),
             );
             if btn.clicked() {
-                if let Ok(place_id) = state.place_id_input.parse::<u64>() {
-                    let job_id = if state.job_id_input.trim().is_empty() {
+                if let Ok(place_id) = place_id_input.parse::<u64>() {
+                    let job_id = if job_id_input.trim().is_empty() {
                         None
                     } else {
-                        Some(state.job_id_input.trim().to_string())
+                        Some(job_id_input.trim().to_string())
                     };
                     action = Some(GroupPanelAction::BulkLaunch { place_id, job_id });
                 }

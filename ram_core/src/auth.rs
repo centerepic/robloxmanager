@@ -77,14 +77,24 @@ impl RobloxClient {
                 }
             }
 
+            // Always send Referer + an empty x-bound-auth-token so requests
+            // line up with what the browser sends. The moderation endpoint
+            // (and a few others) intermittently rejects requests missing
+            // these even when the cookie itself is fine, which made
+            // periodic revalidation overwrite specific ban reasons with the
+            // generic fallback.
+            headers.insert(REFERER, HeaderValue::from_static("https://www.roblox.com/"));
+            headers.insert(
+                "x-bound-auth-token",
+                HeaderValue::from_static(""),
+            );
+
             let mut req = self.inner.request(method.clone(), url).headers(headers);
             if let Some(b) = body {
                 req = req.json(b);
             } else if method == Method::POST {
                 // Roblox POST endpoints require application/json even with no body
-                req = req
-                    .header(CONTENT_TYPE, "application/json")
-                    .header(REFERER, "https://www.roblox.com");
+                req = req.header(CONTENT_TYPE, "application/json");
             }
 
             let resp = req.send().await?;

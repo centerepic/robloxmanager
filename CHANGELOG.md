@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.4.2
+
+### Added
+- **Open browser as account** — right-click an account (or use the new button on the launch panel) to open a webview signed in as that account. Useful for checking profiles, redeeming codes, or appealing moderation without juggling browser profiles.
+- **Launch presets** — saved place + optional Job ID combos, persisted as individual JSON files under `%APPDATA%\RM\presets\` so you can hand-edit, share, or back them up. New "Presets" tab to create, edit, and delete them, with chip rows in both the single-launch and bulk-launch views. Existing favorites are migrated automatically on first launch.
+- **Ban / moderation detection** — periodic revalidation now checks each account's moderation status via Roblox's public profile and `usermoderation.roblox.com` endpoints. Moderated accounts get an orange status dot in the sidebar, a banner in the account panel showing the specific reason and expiry, and a notification when moderation is first detected. Adding a moderated account prompts a confirmation with options to **Open browser as** (to investigate or appeal) or **Add anyway**.
+- **Add anyway for rejected cookies** — if a cookie fails to validate (e.g. terminated alts), an inline "Add anyway" form lets you save the account by looking up the username via Roblox's public API. The cookie is stored as-is and marked expired until you resolve things in a browser.
+- **Re-validate button** — on the moderation confirm dialog, resolve a warning in the browser then re-run validation without re-pasting your cookie.
+- **Refresh all** button in the top bar — manually re-runs cookie validation, moderation checks, presence, and avatar refresh for every account.
+- **Auto-add after browser login** — when the embedded login window captures your cookie, the account is added immediately instead of waiting for you to click "Add" again.
+
+### Changed
+- **UI overhaul** — Launch is now the visual hero of the account panel (large primary button row, accent color), labels float above inputs instead of right-aligned grids, and the Save-as-Preset form is collapsed into a single ⭐ button. The bottom status bar is gone; its info moved into the top bar. Remove Account moved into a `...` menu in the account header. Empty state has a friendlier illustration + heading.
+- **Sidebar rows** — now show the cached avatar thumbnail with a presence dot overlaid on its bottom-right, plus the display name as a subtitle below the username.
+- **Visible textboxes** — global style tweak adds a subtle border + rounding to every interactive widget so inputs no longer blend into their containers.
+- **Shared Place ID / Job ID** — typing into single-account launch now populates the bulk-launch view too, and vice versa.
+- **Account terminated banner** replaces the misleading "Cookie expired" message for accounts Roblox has revoked.
+- **Cleaner Add Account modal** — dropped redundant headings, separators, and the `(N chars)` cookie-length annotation. The Back button is now a small chevron pinned top-left.
+- **Em dashes removed** from all user-facing strings.
+
+### Fixed
+- **Tray Roblox kill** — periodic cleanup now uses a wall-clock timer instead of a frame counter, so it actually runs when the app is idle. Previously the check would only fire after the user generated 600+ UI events.
+- **HTTP requests** — `Referer` and `x-bound-auth-token` headers are now sent on every request, matching real browser behavior. Fixes the moderation endpoint intermittently returning empty messages.
+- **Moderation reason preservation** — periodic revalidation no longer overwrites a specific moderation reason with a generic placeholder when the moderation endpoint is temporarily unreachable.
+
 ## v1.4.1
 
 ### Fixed

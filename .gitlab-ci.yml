@@ -21,6 +21,9 @@ build:
     paths:
       - target/
   script:
+    # The runner service runs as LocalSystem and doesn't inherit Keeper's
+    # cargo/rustup bin on PATH. Prepend it so the toolchain resolves.
+    - $env:PATH = "C:\Users\Keeper\.cargo\bin;" + $env:PATH
     - rustup default stable
     - cargo build --release
     - |
